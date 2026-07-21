@@ -1,3 +1,5 @@
+-- create_table.sql：用于直接在MySQL中生成系统需要的管理表
+
 -- 1. 使用正确的数据库
 USE secsearch;
 
