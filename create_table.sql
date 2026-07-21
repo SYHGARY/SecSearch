@@ -1,9 +1,12 @@
 -- create_table.sql：用于直接在MySQL中生成系统需要的管理表
 
--- 1. 使用正确的数据库
+-- 1. 创建数据库数据库
+CREATE DATABASE secsearch;
+
+-- 2. 使用正确的数据库
 USE secsearch;
 
--- 2. 创建模糊查询倒排索引表
+-- 3. 创建模糊查询倒排索引表
 CREATE TABLE IF NOT EXISTS `fuzzy_inverted` (
   `id` bigint(20) NOT NULL AUTO_INCREMENT COMMENT '自增主键',
   `token_hash` char(64) NOT NULL COMMENT 'Bigram分词的HMAC-SM3盲哈希值（64字符）',
