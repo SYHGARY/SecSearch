@@ -28,11 +28,18 @@
 - MySQL 8.0+
 - OpenSSL（MySQL 依赖）
 
+### 创建MySQL数据库与表单
+
+```sql
+source SecSearch/create_table.sql;
+```
+
 ### 编译
 
 ```bash
-git clone https://github.com/your-username/SecSearch.git
+git clone https://github.com/SYHGARY/SecSearch.git
 cd SecSearch
 mkdir build && cd build
 cmake ..
 make -j
+```
