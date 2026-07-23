@@ -89,7 +89,7 @@ set(SRC_FILES
     src/main.cpp
     src/crypto/utils.cpp
     src/crypto/sm4_cipher.cpp
-    src/crypto/hmac_sm3.cpp
+    src/crypto/sm3_hash.cpp
     src/crypto/key_manager.cpp
     src/crypto/crypto_service.cpp
     src/database/connection_pool.cpp
