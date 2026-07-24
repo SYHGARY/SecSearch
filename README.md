@@ -32,7 +32,7 @@
 ### 编译
 
 ```bash
-git clone https://github.com/SYHGARY/SecSearch.git
+git clone https://github.com/SYHGARY/SecSearch-Linux.git
 cd SecSearch
 mkdir build && cd build
 cmake ..
