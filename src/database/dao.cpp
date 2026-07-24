@@ -73,9 +73,7 @@ int64_t DAO::insertData(const PlainData& data,
                                      phoneCipher, phoneBlind, phoneTag,
                                      addrCipher, addrBlind, addrTag,
                                      encKeyVersion);
-    if (dataId <= 0) {
-        throw std::runtime_error("Insert main table failed");
-    }
+    if (dataId <= 0) throw std::runtime_error("Insert main table failed");
 
     auto nameTokens = splitBigram(data.name);
     auto phoneTokens = splitBigram(data.phone);
@@ -129,7 +127,6 @@ int64_t DAO::insertMainTable(const std::string& nameCipher, const std::string& n
         bind[i].buffer_length = str.size(); \
         bind[i].is_null = 0
 
-    // enc_key_version（整数）
     bind[0].buffer_type = MYSQL_TYPE_LONG;
     bind[0].buffer = (char*)&encKeyVersion;
     bind[0].is_null = 0;
@@ -168,9 +165,7 @@ void DAO::insertFuzzyIndex(int64_t dataId, FieldType type,
     }
 
     MYSQL_STMT* stmt = mysql_stmt_init(conn);
-    if (!stmt) {
-        throw std::runtime_error("mysql_stmt_init failed");
-    }
+    if (!stmt) throw std::runtime_error("mysql_stmt_init failed");
 
     if (mysql_stmt_prepare(stmt, sql.c_str(), sql.length()) != 0) {
         std::string err = mysql_stmt_error(stmt);
@@ -213,7 +208,7 @@ void DAO::insertFuzzyIndex(int64_t dataId, FieldType type,
     mysql_stmt_close(stmt);
 }
 
-// ---- 删除全部模糊索引 ----
+// ---- 删除模糊索引 ----
 void DAO::deleteFuzzyIndex(int64_t dataId) {
     MYSQL* conn = connGuard_->get();
     const char* sql = "DELETE FROM fuzzy_inverted WHERE data_id = ?";
@@ -236,10 +231,12 @@ void DAO::deleteFuzzyIndex(int64_t dataId) {
     mysql_stmt_close(stmt);
 }
 
-// ---- 精确查询 ----
-std::vector<int64_t> DAO::queryByExactIndex(const std::string& blindHash,
-                                            FieldType fieldType) {
+// ---- ★ 多版本精确查询 ----
+std::vector<int64_t> DAO::queryByExactIndexMulti(const std::vector<std::string>& blindHashes,
+                                                 FieldType fieldType) {
     std::vector<int64_t> ids;
+    if (blindHashes.empty()) return ids;
+
     MYSQL* conn = connGuard_->get();
 
     std::string column;
@@ -250,20 +247,30 @@ std::vector<int64_t> DAO::queryByExactIndex(const std::string& blindHash,
         default: throw std::runtime_error("Invalid field type");
     }
 
-    std::string sql = "SELECT id FROM sensitive_data WHERE " + column + " = ?";
+    std::string inPlaceholders;
+    for (size_t i = 0; i < blindHashes.size(); ++i) {
+        if (i > 0) inPlaceholders += ",";
+        inPlaceholders += "?";
+    }
+
+    std::string sql = "SELECT id FROM sensitive_data WHERE " + column + " IN (" + inPlaceholders + ")";
+
     MYSQL_STMT* stmt = mysql_stmt_init(conn);
     if (!stmt || mysql_stmt_prepare(stmt, sql.c_str(), sql.length()) != 0) {
         if (stmt) mysql_stmt_close(stmt);
-        throw std::runtime_error("Prepare exact query failed");
+        throw std::runtime_error("Prepare multi exact query failed");
     }
 
-    MYSQL_BIND bind[1];
-    memset(bind, 0, sizeof(bind));
-    bind[0].buffer_type = MYSQL_TYPE_STRING;
-    bind[0].buffer = (char*)blindHash.c_str();
-    bind[0].buffer_length = blindHash.size();
+    std::vector<MYSQL_BIND> bind(blindHashes.size());
+    std::vector<std::string> hashCopies = blindHashes;
+    for (size_t i = 0; i < blindHashes.size(); ++i) {
+        bind[i].buffer_type = MYSQL_TYPE_STRING;
+        bind[i].buffer = (char*)hashCopies[i].c_str();
+        bind[i].buffer_length = hashCopies[i].size();
+        bind[i].is_null = 0;
+    }
 
-    if (mysql_stmt_bind_param(stmt, bind) != 0 ||
+    if (mysql_stmt_bind_param(stmt, bind.data()) != 0 ||
         mysql_stmt_execute(stmt) != 0) {
         mysql_stmt_close(stmt);
         throw std::runtime_error(mysql_stmt_error(stmt));
@@ -281,44 +288,39 @@ std::vector<int64_t> DAO::queryByExactIndex(const std::string& blindHash,
         throw std::runtime_error(mysql_stmt_error(stmt));
     }
 
-    while (mysql_stmt_fetch(stmt) == 0) {
-        ids.push_back(id);
-    }
+    while (mysql_stmt_fetch(stmt) == 0) ids.push_back(id);
     mysql_stmt_close(stmt);
     return ids;
 }
 
-// ---- 模糊查询 ----
-std::vector<int64_t> DAO::queryByFuzzyKeyword(const std::string& keyword,
-                                              FieldType fieldType,
-                                              const std::vector<unsigned char>& idxKey) {
-    auto tokens = splitBigram(keyword);
-    if (tokens.empty()) return {};
-
-    auto hashes = hashTokens(tokens, idxKey);
+// ---- ★ 多版本模糊查询 ----
+std::vector<int64_t> DAO::queryByFuzzyKeywordMulti(const std::vector<std::string>& tokenHashes,
+                                                   FieldType fieldType) {
+    std::vector<int64_t> ids;
+    if (tokenHashes.empty()) return ids;
 
     MYSQL* conn = connGuard_->get();
 
     std::string inPlaceholders;
-    for (size_t i = 0; i < hashes.size(); ++i) {
+    for (size_t i = 0; i < tokenHashes.size(); ++i) {
         if (i > 0) inPlaceholders += ",";
         inPlaceholders += "?";
     }
 
     std::string sql = "SELECT data_id FROM fuzzy_inverted WHERE token_hash IN (" + inPlaceholders +
-          ") AND field_type = ? GROUP BY data_id HAVING COUNT(DISTINCT token_hash) = ?";
+                      ") AND field_type = ? GROUP BY data_id HAVING COUNT(DISTINCT token_hash) = ?";
 
     MYSQL_STMT* stmt = mysql_stmt_init(conn);
     if (!stmt || mysql_stmt_prepare(stmt, sql.c_str(), sql.length()) != 0) {
         if (stmt) mysql_stmt_close(stmt);
-        throw std::runtime_error("Prepare fuzzy query failed");
+        throw std::runtime_error("Prepare multi fuzzy query failed");
     }
 
-    size_t paramCount = hashes.size() + 2;
+    size_t paramCount = tokenHashes.size() + 2;
     std::vector<MYSQL_BIND> bind(paramCount);
-    std::vector<std::string> hashCopies = hashes;
+    std::vector<std::string> hashCopies = tokenHashes;
 
-    for (size_t i = 0; i < hashes.size(); ++i) {
+    for (size_t i = 0; i < tokenHashes.size(); ++i) {
         bind[i].buffer_type = MYSQL_TYPE_STRING;
         bind[i].buffer = (char*)hashCopies[i].c_str();
         bind[i].buffer_length = hashCopies[i].size();
@@ -326,15 +328,14 @@ std::vector<int64_t> DAO::queryByFuzzyKeyword(const std::string& keyword,
     }
 
     uint8_t ft = static_cast<uint8_t>(fieldType);
-    size_t tokenCount = hashes.size();
+    size_t tokenCount = tokenHashes.size();
+    bind[tokenHashes.size()].buffer_type = MYSQL_TYPE_TINY;
+    bind[tokenHashes.size()].buffer = (char*)&ft;
+    bind[tokenHashes.size()].is_null = 0;
 
-    bind[hashes.size()].buffer_type = MYSQL_TYPE_TINY;
-    bind[hashes.size()].buffer = (char*)&ft;
-    bind[hashes.size()].is_null = 0;
-
-    bind[hashes.size() + 1].buffer_type = MYSQL_TYPE_LONGLONG;
-    bind[hashes.size() + 1].buffer = (char*)&tokenCount;
-    bind[hashes.size() + 1].is_null = 0;
+    bind[tokenHashes.size() + 1].buffer_type = MYSQL_TYPE_LONGLONG;
+    bind[tokenHashes.size() + 1].buffer = (char*)&tokenCount;
+    bind[tokenHashes.size() + 1].is_null = 0;
 
     if (mysql_stmt_bind_param(stmt, bind.data()) != 0 ||
         mysql_stmt_execute(stmt) != 0) {
@@ -342,7 +343,6 @@ std::vector<int64_t> DAO::queryByFuzzyKeyword(const std::string& keyword,
         throw std::runtime_error(mysql_stmt_error(stmt));
     }
 
-    std::vector<int64_t> ids;
     MYSQL_BIND out_bind[1];
     memset(out_bind, 0, sizeof(out_bind));
     int64_t dataId;
@@ -355,11 +355,19 @@ std::vector<int64_t> DAO::queryByFuzzyKeyword(const std::string& keyword,
         throw std::runtime_error(mysql_stmt_error(stmt));
     }
 
-    while (mysql_stmt_fetch(stmt) == 0) {
-        ids.push_back(dataId);
-    }
+    while (mysql_stmt_fetch(stmt) == 0) ids.push_back(dataId);
     mysql_stmt_close(stmt);
     return ids;
+}
+
+// ---- 单版本模糊查询 ----
+std::vector<int64_t> DAO::queryByFuzzyKeyword(const std::string& keyword,
+                                              FieldType fieldType,
+                                              const std::vector<unsigned char>& idxKey) {
+    auto tokens = splitBigram(keyword);
+    if (tokens.empty()) return {};
+    auto hashes = hashTokens(tokens, idxKey);
+    return queryByFuzzyKeywordMulti(hashes, fieldType);
 }
 
 // ---- 批量读取密文 ----
@@ -579,6 +587,194 @@ bool DAO::deleteData(int64_t id) {
 
     tx.commit();
     return true;
+
+    
+}
+
+// ---- ★ 从 key_config 表加载所有密钥（密文形式） ----
+std::vector<crypto::KeyInfo> DAO::loadAllKeysFromConfig(int keyType) const {
+    std::vector<crypto::KeyInfo> keys;
+    MYSQL* conn = connGuard_->get();
+
+    const char* sql = "SELECT key_version, key_cipher, status FROM key_config WHERE key_type = ? ORDER BY key_version ASC";
+    MYSQL_STMT* stmt = mysql_stmt_init(conn);
+    if (!stmt) return keys;
+
+    if (mysql_stmt_prepare(stmt, sql, strlen(sql)) != 0) {
+        mysql_stmt_close(stmt);
+        return keys;
+    }
+
+    MYSQL_BIND bind[1];
+    memset(bind, 0, sizeof(bind));
+    bind[0].buffer_type = MYSQL_TYPE_TINY;
+    bind[0].buffer = (char*)&keyType;
+    bind[0].is_null = 0;
+
+    if (mysql_stmt_bind_param(stmt, bind) != 0 ||
+        mysql_stmt_execute(stmt) != 0) {
+        mysql_stmt_close(stmt);
+        return keys;
+    }
+
+    MYSQL_BIND out_bind[3];
+    memset(out_bind, 0, sizeof(out_bind));
+
+    int version;
+    char keyCipher[4096];
+    int status;
+    unsigned long keyCipherLen;
+
+    out_bind[0].buffer_type = MYSQL_TYPE_LONG;
+    out_bind[0].buffer = &version;
+    out_bind[0].is_null = 0;
+
+    out_bind[1].buffer_type = MYSQL_TYPE_STRING;
+    out_bind[1].buffer = keyCipher;
+    out_bind[1].buffer_length = sizeof(keyCipher);
+    out_bind[1].length = &keyCipherLen;
+    out_bind[1].is_null = 0;
+
+    out_bind[2].buffer_type = MYSQL_TYPE_TINY;
+    out_bind[2].buffer = &status;
+    out_bind[2].is_null = 0;
+
+    if (mysql_stmt_bind_result(stmt, out_bind) != 0) {
+        mysql_stmt_close(stmt);
+        return keys;
+    }
+
+    while (mysql_stmt_fetch(stmt) == 0) {
+        crypto::KeyInfo info;
+        info.version = version;
+        info.status = static_cast<crypto::KeyStatus>(status);
+        // 存储密文（调用者用 KEK 解密）
+        info.key = std::vector<unsigned char>(keyCipher, keyCipher + keyCipherLen);
+        keys.push_back(info);
+    }
+
+    mysql_stmt_close(stmt);
+    return keys;
+}
+
+// ---- ★ 保存密钥到 key_config 表 ----
+void DAO::saveKeyToConfig(int keyType, const std::vector<unsigned char>& key,
+                          int version, crypto::KeyStatus status) {
+    MYSQL* conn = connGuard_->get();
+    Transaction tx(conn);
+
+    const char* sql = R"(
+        INSERT INTO key_config (key_type, key_cipher, key_version, status)
+        VALUES (?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE key_cipher = ?, status = ?
+    )";
+    MYSQL_STMT* stmt = mysql_stmt_init(conn);
+    if (!stmt || mysql_stmt_prepare(stmt, sql, strlen(sql)) != 0) {
+        if (stmt) mysql_stmt_close(stmt);
+        throw std::runtime_error("Prepare save key failed");
+    }
+
+    // ★ 密钥已由调用者加密，直接存储 Base64 或十六进制
+    // 这里 key 已经是密文字节，转为字符串存储
+    std::string keyStr(key.begin(), key.end());
+    uint8_t statusByte = static_cast<uint8_t>(status);
+
+    MYSQL_BIND bind[6];
+    memset(bind, 0, sizeof(bind));
+
+    bind[0].buffer_type = MYSQL_TYPE_TINY;
+    bind[0].buffer = (char*)&keyType;
+    bind[0].is_null = 0;
+
+    bind[1].buffer_type = MYSQL_TYPE_STRING;
+    bind[1].buffer = (char*)keyStr.c_str();
+    bind[1].buffer_length = keyStr.size();
+    bind[1].is_null = 0;
+
+    bind[2].buffer_type = MYSQL_TYPE_LONG;
+    bind[2].buffer = (char*)&version;
+    bind[2].is_null = 0;
+
+    bind[3].buffer_type = MYSQL_TYPE_TINY;
+    bind[3].buffer = (char*)&statusByte;
+    bind[3].is_null = 0;
+
+    bind[4].buffer_type = MYSQL_TYPE_STRING;
+    bind[4].buffer = (char*)keyStr.c_str();
+    bind[4].buffer_length = keyStr.size();
+    bind[4].is_null = 0;
+
+    bind[5].buffer_type = MYSQL_TYPE_TINY;
+    bind[5].buffer = (char*)&statusByte;
+    bind[5].is_null = 0;
+
+    if (mysql_stmt_bind_param(stmt, bind) != 0 ||
+        mysql_stmt_execute(stmt) != 0) {
+        mysql_stmt_close(stmt);
+        throw std::runtime_error("Execute save key failed");
+    }
+
+    mysql_stmt_close(stmt);
+    tx.commit();
+}
+
+// ---- ★ 更新密钥状态 ----
+void DAO::updateKeyStatusInConfig(int keyType, int version, crypto::KeyStatus status) {
+    MYSQL* conn = connGuard_->get();
+    uint8_t statusByte = static_cast<uint8_t>(status);
+
+    const char* sql = "UPDATE key_config SET status = ? WHERE key_type = ? AND key_version = ?";
+    MYSQL_STMT* stmt = mysql_stmt_init(conn);
+    if (!stmt || mysql_stmt_prepare(stmt, sql, strlen(sql)) != 0) {
+        if (stmt) mysql_stmt_close(stmt);
+        throw std::runtime_error("Prepare update key status failed");
+    }
+
+    MYSQL_BIND bind[3];
+    memset(bind, 0, sizeof(bind));
+    bind[0].buffer_type = MYSQL_TYPE_TINY;
+    bind[0].buffer = (char*)&statusByte;
+    bind[0].is_null = 0;
+    bind[1].buffer_type = MYSQL_TYPE_TINY;
+    bind[1].buffer = (char*)&keyType;
+    bind[1].is_null = 0;
+    bind[2].buffer_type = MYSQL_TYPE_LONG;
+    bind[2].buffer = (char*)&version;
+    bind[2].is_null = 0;
+
+    if (mysql_stmt_bind_param(stmt, bind) != 0 ||
+        mysql_stmt_execute(stmt) != 0) {
+        mysql_stmt_close(stmt);
+        throw std::runtime_error("Execute update key status failed");
+    }
+    mysql_stmt_close(stmt);
+}
+
+// ---- ★ 删除密钥 ----
+void DAO::deleteKeyFromConfig(int keyType, int version) {
+    MYSQL* conn = connGuard_->get();
+    const char* sql = "DELETE FROM key_config WHERE key_type = ? AND key_version = ?";
+    MYSQL_STMT* stmt = mysql_stmt_init(conn);
+    if (!stmt || mysql_stmt_prepare(stmt, sql, strlen(sql)) != 0) {
+        if (stmt) mysql_stmt_close(stmt);
+        throw std::runtime_error("Prepare delete key failed");
+    }
+
+    MYSQL_BIND bind[2];
+    memset(bind, 0, sizeof(bind));
+    bind[0].buffer_type = MYSQL_TYPE_TINY;
+    bind[0].buffer = (char*)&keyType;
+    bind[0].is_null = 0;
+    bind[1].buffer_type = MYSQL_TYPE_LONG;
+    bind[1].buffer = (char*)&version;
+    bind[1].is_null = 0;
+
+    if (mysql_stmt_bind_param(stmt, bind) != 0 ||
+        mysql_stmt_execute(stmt) != 0) {
+        mysql_stmt_close(stmt);
+        throw std::runtime_error("Execute delete key failed");
+    }
+    mysql_stmt_close(stmt);
 }
 
 } // namespace database

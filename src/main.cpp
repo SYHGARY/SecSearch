@@ -1,7 +1,7 @@
 // main.cpp
 // 交互式命令行程序，提供增删改查功能
-// 用户通过菜单选择操作类型，输入数据后执行
-// ★ 基于 OpenHiTLS 加密库
+// 支持密钥多版本管理、主动轮换、定时轮换、持久化到 key_config 表
+// 基于 OpenHiTLS 加密库
 
 #include "database/dao.h"
 #include "database/connection_pool.h"
@@ -10,7 +10,6 @@
 #include "crypto/sm4_cipher.h"
 #include "crypto/hmac_sm3.h"
 
-// ★ OpenHiTLS 初始化和清理头文件
 #include <hitls/crypto/crypt_eal_init.h>
 #include <hitls/crypto/crypt_errno.h>
 
@@ -19,8 +18,9 @@
 #include <limits>
 #include <vector>
 #include <iomanip>
+#include <cstring>
+#include <chrono>
 
-// 密码输入头文件
 #ifdef _WIN32
     #include <conio.h>
 #else
@@ -36,6 +36,10 @@ crypto::KeyManager g_keyMgr;
 std::vector<unsigned char> g_encKey;
 std::vector<unsigned char> g_idxKey;
 std::vector<unsigned char> g_tagKey;
+
+// ---- 定时轮换配置 ----
+const int AUTO_ROTATE_DAYS = 90;
+const std::string ROTATE_TIME_FILE = ".key_rotate_time";
 
 // ---- 辅助函数 ----
 
@@ -56,12 +60,9 @@ int getIntInput(const std::string& prompt, int defaultVal = 0) {
     while (true) {
         std::cout << prompt;
         std::getline(std::cin, line);
-        if (line.empty()) {
-            return defaultVal;
-        }
+        if (line.empty()) return defaultVal;
         try {
-            int value = std::stoi(line);
-            return value;
+            return std::stoi(line);
         } catch (const std::exception&) {
             std::cout << "输入无效，请输入数字。" << std::endl;
         }
@@ -108,13 +109,10 @@ FieldType getFieldType() {
         case 1: return FieldType::NAME;
         case 2: return FieldType::PHONE;
         case 3: return FieldType::ADDRESS;
-        default:
-            std::cout << "输入无效，默认使用姓名。" << std::endl;
-            return FieldType::NAME;
+        default: return FieldType::NAME;
     }
 }
 
-// ★ 打印查询结果（含密钥版本号）
 void printFullRecords(const std::vector<FullRecord>& results) {
     if (results.empty()) {
         std::cout << "未找到匹配记录。" << std::endl;
@@ -140,12 +138,152 @@ void printFullRecords(const std::vector<FullRecord>& results) {
     std::cout << "+-----+------------------+------------------+----------------------------------------+-------+" << std::endl;
 }
 
-// ---- 功能函数 ----
+// ---- ★ 定时轮换检查和执行（需要 DAO 引用） ----
+bool checkAndAutoRotate(database::DAO& dao) {
+    g_keyMgr.loadRotateTimeFromFile(ROTATE_TIME_FILE);
+    auto lastTime = g_keyMgr.getLastRotateTime();
+    auto now = std::chrono::system_clock::now();
 
-// 1. 插入数据
+    auto diff = std::chrono::duration_cast<std::chrono::hours>(now - lastTime).count();
+    int days = diff / 24;
+
+    if (days >= AUTO_ROTATE_DAYS) {
+        std::cout << "\n🔄 【定时轮换】距上次轮换已 " << days << " 天，超过 " << AUTO_ROTATE_DAYS << " 天阈值，自动轮换..." << std::endl;
+        try {
+            int newEncVer = g_keyMgr.rotateEncryptionKey();
+            int newIdxVer = g_keyMgr.rotateIndexKey();
+            int newTagVer = g_keyMgr.rotateTagKey();
+
+            // ★ 保存新密钥到数据库
+            auto encKey = g_keyMgr.getEncryptionKey();
+            auto idxKey = g_keyMgr.getIndexKey();
+            auto tagKey = g_keyMgr.getTagKey();
+            g_keyMgr.saveToDatabase(dao, 1, encKey, newEncVer, crypto::KeyStatus::ENABLED);
+            g_keyMgr.saveToDatabase(dao, 2, idxKey, newIdxVer, crypto::KeyStatus::ENABLED);
+            g_keyMgr.saveToDatabase(dao, 3, tagKey, newTagVer, crypto::KeyStatus::ENABLED);
+
+            g_keyMgr.saveRotateTimeToFile(ROTATE_TIME_FILE);
+
+            g_encKey = g_keyMgr.getEncryptionKey();
+            g_idxKey = g_keyMgr.getIndexKey();
+            g_tagKey = g_keyMgr.getTagKey();
+
+            std::cout << "✅ 定时轮换完成！（已保存到 key_config）" << std::endl;
+            std::cout << "   加密密钥: 版本 " << newEncVer << " (启用)" << std::endl;
+            std::cout << "   索引密钥: 版本 " << newIdxVer << " (启用)" << std::endl;
+            std::cout << "   Tag 密钥: 版本 " << newTagVer << " (启用)" << std::endl;
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "❌ 定时轮换失败: " << e.what() << std::endl;
+            return false;
+        }
+    }
+    return false;
+}
+
+// ---- ★ 主动密钥管理（传入 DAO 引用） ----
+void keyManagement(database::DAO& dao) {
+    std::cout << "\n========== 🔑 密钥管理 ==========" << std::endl;
+    std::cout << "当前加密密钥版本: " << g_keyMgr.getEncryptionVersion() << " (启用)" << std::endl;
+    std::cout << "当前索引密钥版本: " << g_keyMgr.getIndexVersion() << " (启用)" << std::endl;
+    std::cout << "当前 Tag 密钥版本: " << g_keyMgr.getTagVersion() << " (启用)" << std::endl;
+
+    auto allEnc = g_keyMgr.getAllEncryptionVersions();
+    std::cout << "所有加密密钥版本: ";
+    for (int v : allEnc) std::cout << v << " ";
+    std::cout << std::endl;
+
+    auto lastTime = g_keyMgr.getLastRotateTime();
+    auto time_t = std::chrono::system_clock::to_time_t(lastTime);
+    std::cout << "上次轮换时间: " << std::ctime(&time_t);
+
+    auto now = std::chrono::system_clock::now();
+    auto diff = std::chrono::duration_cast<std::chrono::hours>(now - lastTime).count();
+    std::cout << "距上次轮换: " << (diff / 24) << " 天 (阈值: " << AUTO_ROTATE_DAYS << " 天)";
+    if (diff / 24 >= AUTO_ROTATE_DAYS) std::cout << " ⚠️ 已超过阈值！";
+    std::cout << std::endl;
+
+    std::cout << "----------------------------------------" << std::endl;
+    std::cout << "  1. 轮换加密密钥" << std::endl;
+    std::cout << "  2. 轮换索引密钥" << std::endl;
+    std::cout << "  3. 轮换 Tag 密钥" << std::endl;
+    std::cout << "  4. 全部轮换" << std::endl;
+    std::cout << "  5. 查看所有密钥版本" << std::endl;
+    std::cout << "  6. 重置轮换计时器" << std::endl;
+    std::cout << "  0. 返回" << std::endl;
+
+    int choice = getIntInput("请选择: ", 0);
+    switch (choice) {
+        case 1: {
+            int v = g_keyMgr.rotateEncryptionKey();
+            auto key = g_keyMgr.getEncryptionKey();
+            g_keyMgr.saveToDatabase(dao, 1, key, v, crypto::KeyStatus::ENABLED);
+            g_keyMgr.saveRotateTimeToFile(ROTATE_TIME_FILE);
+            g_encKey = g_keyMgr.getEncryptionKey();
+            std::cout << "✅ 加密密钥已轮换，新版本: " << v << " (已保存到数据库)" << std::endl;
+            break;
+        }
+        case 2: {
+            int v = g_keyMgr.rotateIndexKey();
+            auto key = g_keyMgr.getIndexKey();
+            g_keyMgr.saveToDatabase(dao, 2, key, v, crypto::KeyStatus::ENABLED);
+            g_keyMgr.saveRotateTimeToFile(ROTATE_TIME_FILE);
+            g_idxKey = g_keyMgr.getIndexKey();
+            std::cout << "✅ 索引密钥已轮换，新版本: " << v << " (已保存到数据库)" << std::endl;
+            break;
+        }
+        case 3: {
+            int v = g_keyMgr.rotateTagKey();
+            auto key = g_keyMgr.getTagKey();
+            g_keyMgr.saveToDatabase(dao, 3, key, v, crypto::KeyStatus::ENABLED);
+            g_keyMgr.saveRotateTimeToFile(ROTATE_TIME_FILE);
+            g_tagKey = g_keyMgr.getTagKey();
+            std::cout << "✅ Tag 密钥已轮换，新版本: " << v << " (已保存到数据库)" << std::endl;
+            break;
+        }
+        case 4: {
+            int ev = g_keyMgr.rotateEncryptionKey();
+            int iv = g_keyMgr.rotateIndexKey();
+            int tv = g_keyMgr.rotateTagKey();
+            auto ekey = g_keyMgr.getEncryptionKey();
+            auto ikey = g_keyMgr.getIndexKey();
+            auto tkey = g_keyMgr.getTagKey();
+            g_keyMgr.saveToDatabase(dao, 1, ekey, ev, crypto::KeyStatus::ENABLED);
+            g_keyMgr.saveToDatabase(dao, 2, ikey, iv, crypto::KeyStatus::ENABLED);
+            g_keyMgr.saveToDatabase(dao, 3, tkey, tv, crypto::KeyStatus::ENABLED);
+            g_keyMgr.saveRotateTimeToFile(ROTATE_TIME_FILE);
+            g_encKey = g_keyMgr.getEncryptionKey();
+            g_idxKey = g_keyMgr.getIndexKey();
+            g_tagKey = g_keyMgr.getTagKey();
+            std::cout << "✅ 全部轮换完成！加密:" << ev << " 索引:" << iv << " Tag:" << tv << std::endl;
+            break;
+        }
+        case 5: {
+            auto encV = g_keyMgr.getAllEncryptionVersions();
+            auto idxV = g_keyMgr.getAllIndexVersions();
+            auto tagV = g_keyMgr.getAllTagVersions();
+            std::cout << "加密密钥版本: ";
+            for (int v : encV) std::cout << v << " ";
+            std::cout << "\n索引密钥版本: ";
+            for (int v : idxV) std::cout << v << " ";
+            std::cout << "\nTag 密钥版本: ";
+            for (int v : tagV) std::cout << v << " ";
+            std::cout << std::endl;
+            break;
+        }
+        case 6: {
+            g_keyMgr.setLastRotateTime(std::chrono::system_clock::now());
+            g_keyMgr.saveRotateTimeToFile(ROTATE_TIME_FILE);
+            std::cout << "✅ 计时器已重置" << std::endl;
+            break;
+        }
+        default: break;
+    }
+}
+
+// ---- 业务功能 ----
 void insertData(DAO& dao) {
     std::cout << "\n========== 插入数据 ==========" << std::endl;
-
     PlainData data;
     data.name = getStringInput("请输入姓名: ");
     data.phone = getStringInput("请输入手机号: ");
@@ -154,60 +292,46 @@ void insertData(DAO& dao) {
     try {
         int encVersion = g_keyMgr.getEncryptionVersion();
         int64_t id = dao.insertData(data, g_encKey, g_idxKey, g_tagKey, encVersion);
-        std::cout << "✅ 插入成功！记录 ID = " << id << " (密钥版本: " << encVersion << ")" << std::endl;
+        std::cout << "✅ 插入成功！ID = " << id << " (密钥版本: " << encVersion << ")" << std::endl;
+        checkAndAutoRotate(dao);
     } catch (const std::exception& e) {
         std::cout << "❌ 插入失败: " << e.what() << std::endl;
     }
 }
 
-// 2. 精确查询
 void exactQuery(QueryService& qs) {
     std::cout << "\n========== 精确查询 ==========" << std::endl;
-    FieldType fieldType = getFieldType();
+    FieldType ft = getFieldType();
     std::string keyword = getStringInput("请输入查询关键词: ");
-
-    if (keyword.empty()) {
-        std::cout << "关键词不能为空。" << std::endl;
-        return;
-    }
+    if (keyword.empty()) { std::cout << "关键词不能为空。" << std::endl; return; }
 
     try {
-        auto results = qs.exactQuery(keyword, fieldType, g_idxKey, g_encKey, g_tagKey);
+        auto results = qs.exactQuery(keyword, ft, g_idxKey, g_encKey, g_tagKey);
         printFullRecords(results);
     } catch (const std::exception& e) {
         std::cout << "❌ 查询失败: " << e.what() << std::endl;
     }
 }
 
-// 3. 模糊查询
 void fuzzyQuery(QueryService& qs) {
     std::cout << "\n========== 模糊查询 ==========" << std::endl;
-    std::cout << "（支持中缀匹配，如输入 '张' 可匹配 '张三'、'张伟'）" << std::endl;
-    FieldType fieldType = getFieldType();
+    std::cout << "（支持中缀匹配，如 '张' 匹配 '张三'、'张伟'）" << std::endl;
+    FieldType ft = getFieldType();
     std::string keyword = getStringInput("请输入查询关键词: ");
-
-    if (keyword.empty()) {
-        std::cout << "关键词不能为空。" << std::endl;
-        return;
-    }
+    if (keyword.empty()) { std::cout << "关键词不能为空。" << std::endl; return; }
 
     try {
-        auto results = qs.fuzzyQuery(keyword, fieldType, g_idxKey, g_encKey, g_tagKey);
+        auto results = qs.fuzzyQuery(keyword, ft, g_idxKey, g_encKey, g_tagKey);
         printFullRecords(results);
     } catch (const std::exception& e) {
         std::cout << "❌ 查询失败: " << e.what() << std::endl;
     }
 }
 
-// 4. 更新数据
 void updateData(DAO& dao) {
     std::cout << "\n========== 更新数据 ==========" << std::endl;
     int64_t id = getIntInput("请输入要更新的记录 ID: ", 0);
-
-    if (id <= 0) {
-        std::cout << "无效的 ID。" << std::endl;
-        return;
-    }
+    if (id <= 0) { std::cout << "无效的 ID。" << std::endl; return; }
 
     try {
         PlainData newData;
@@ -221,50 +345,36 @@ void updateData(DAO& dao) {
         if (success) {
             std::cout << "✅ 更新成功！(新密钥版本: " << encVersion << ")" << std::endl;
         } else {
-            std::cout << "❌ 更新失败（可能记录不存在）。" << std::endl;
+            std::cout << "❌ 更新失败（记录可能不存在）。" << std::endl;
         }
     } catch (const std::exception& e) {
         std::cout << "❌ 更新失败: " << e.what() << std::endl;
     }
 }
 
-// 5. 删除数据
 void deleteData(DAO& dao) {
     std::cout << "\n========== 删除数据 ==========" << std::endl;
     int64_t id = getIntInput("请输入要删除的记录 ID: ", 0);
+    if (id <= 0) { std::cout << "无效的 ID。" << std::endl; return; }
 
-    if (id <= 0) {
-        std::cout << "无效的 ID。" << std::endl;
-        return;
-    }
-
-    std::cout << "⚠️  确认删除 ID = " << id << " 的记录？(y/N): ";
+    std::cout << "⚠️ 确认删除 ID = " << id << " ? (y/N): ";
     std::string confirm;
     std::getline(std::cin, confirm);
-
-    if (confirm != "y" && confirm != "Y") {
-        std::cout << "操作已取消。" << std::endl;
-        return;
-    }
+    if (confirm != "y" && confirm != "Y") { std::cout << "已取消。" << std::endl; return; }
 
     try {
-        bool success = dao.deleteData(id);
-        if (success) {
-            std::cout << "✅ 删除成功！" << std::endl;
-        } else {
-            std::cout << "❌ 删除失败（记录可能不存在）。" << std::endl;
-        }
+        if (dao.deleteData(id)) std::cout << "✅ 删除成功！" << std::endl;
+        else std::cout << "❌ 删除失败。" << std::endl;
     } catch (const std::exception& e) {
         std::cout << "❌ 删除失败: " << e.what() << std::endl;
     }
 }
 
-// 6. 查看所有记录
 void listAllRecords(DAO& dao) {
     std::cout << "\n========== 查看所有记录 ==========" << std::endl;
-    std::cout << "（显示姓名包含'张'或手机号包含'138'的记录）" << std::endl;
+    std::cout << "（显示姓名含'张'或手机号含'138'的记录）" << std::endl;
 
-    QueryService qs(dao);
+    QueryService qs(dao, g_keyMgr);
     try {
         auto results = qs.fuzzyQuery("张", FieldType::NAME, g_idxKey, g_encKey, g_tagKey);
         if (results.empty()) {
@@ -280,7 +390,6 @@ void listAllRecords(DAO& dao) {
     }
 }
 
-// ---- 主菜单 ----
 void showMenu() {
     std::cout << "\n╔═══════════════════════════════════════════════════════════╗" << std::endl;
     std::cout << "║              🔐 密文数据库查询系统                        ║" << std::endl;
@@ -291,6 +400,7 @@ void showMenu() {
     std::cout << "║  4. 更新数据                                              ║" << std::endl;
     std::cout << "║  5. 删除数据                                              ║" << std::endl;
     std::cout << "║  6. 查看所有记录（调试）                                   ║" << std::endl;
+    std::cout << "║  7. 🔑 密钥管理（轮换/状态）                               ║" << std::endl;
     std::cout << "║  0. 退出                                                  ║" << std::endl;
     std::cout << "╚═══════════════════════════════════════════════════════════╝" << std::endl;
 }
@@ -308,19 +418,15 @@ int main() {
 
         std::string host = getStringInput("数据库地址 (默认 127.0.0.1): ");
         if (host.empty()) host = "127.0.0.1";
-
         std::string user = getStringInput("用户名 (默认 root): ");
         if (user.empty()) user = "root";
-
         std::string password = getPasswordInput("请输入数据库密码: ");
-
         std::string db = getStringInput("数据库名 (默认 testdb): ");
         if (db.empty()) db = "testdb";
-
         int port = getIntInput("端口号 (默认 3306): ", 3306);
 
         // ============================================================
-        // 2. 初始化 OpenHiTLS 加密库
+        // 2. 初始化 OpenHiTLS
         // ============================================================
         std::cout << "\n🔐 正在初始化加密引擎..." << std::endl;
         int32_t ret = CRYPT_EAL_Init(CRYPT_EAL_INIT_ALL);
@@ -331,29 +437,52 @@ int main() {
         std::cout << "✅ 加密引擎初始化成功！" << std::endl;
 
         // ============================================================
-        // 3. 初始化连接池
+        // 3. 连接数据库
         // ============================================================
         std::cout << "\n🔌 正在连接数据库..." << std::endl;
         getGlobalConnectionPool().init(host, user, password, db, port, 5);
         std::cout << "✅ 数据库连接成功！" << std::endl;
 
         // ============================================================
-        // 4. 初始化密钥管理器
+        // 4. 初始化 DAO（用于密钥加载和后续操作）
         // ============================================================
-        std::cout << "🔑 正在加载密钥..." << std::endl;
+        DAO dao;
 
+        // ============================================================
+        // 5. 初始化密钥管理器（从 key_config 表加载）
+        // ============================================================
+        std::cout << "🔑 正在从 key_config 表加载密钥..." << std::endl;
+
+        // 主密钥 KEK（实际应来自环境变量或安全配置）
         std::vector<unsigned char> kek(16, 0x11);
         g_keyMgr.init(kek);
 
-        std::vector<unsigned char> rawEnc(16, 0xA0);
-        std::vector<unsigned char> rawIdx(16, 0xB0);
-        std::vector<unsigned char> rawTag(16, 0xC0);
+        try {
+            // ★ 从数据库加载所有历史密钥
+            g_keyMgr.loadFromDatabase(dao, kek);
+            std::cout << "✅ 从 key_config 加载成功！" << std::endl;
+            std::cout << "   加密密钥版本数: " << g_keyMgr.getAllEncryptionVersions().size() << std::endl;
+            std::cout << "   索引密钥版本数: " << g_keyMgr.getAllIndexVersions().size() << std::endl;
+            std::cout << "   Tag 密钥版本数: " << g_keyMgr.getAllTagVersions().size() << std::endl;
+            std::cout << "   当前加密密钥版本: " << g_keyMgr.getEncryptionVersion() << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "❌ 从 key_config 加载失败: " << e.what() << std::endl;
+            std::cerr << "   正在初始化初始密钥..." << std::endl;
 
-        std::string encCipher = crypto::Sm4Cipher::encrypt(rawEnc, kek);
-        std::string idxCipher = crypto::Sm4Cipher::encrypt(rawIdx, kek);
-        std::string tagCipher = crypto::Sm4Cipher::encrypt(rawTag, kek);
+            // ★ 初始化三组密钥（第一次运行时）
+            std::vector<unsigned char> initEnc(16, 0xA0);
+            std::vector<unsigned char> initIdx(16, 0xB0);
+            std::vector<unsigned char> initTag(16, 0xC0);
 
-        g_keyMgr.loadKeys(encCipher, idxCipher, tagCipher);
+            // 加密后存入 key_config
+            g_keyMgr.saveToDatabase(dao, 1, initEnc, 1, crypto::KeyStatus::ENABLED);
+            g_keyMgr.saveToDatabase(dao, 2, initIdx, 1, crypto::KeyStatus::ENABLED);
+            g_keyMgr.saveToDatabase(dao, 3, initTag, 1, crypto::KeyStatus::ENABLED);
+
+            // 重新加载
+            g_keyMgr.loadFromDatabase(dao, kek);
+            std::cout << "✅ 初始密钥已生成并保存到 key_config" << std::endl;
+        }
 
         g_encKey = g_keyMgr.getEncryptionKey();
         g_idxKey = g_keyMgr.getIndexKey();
@@ -362,15 +491,20 @@ int main() {
         std::cout << "✅ 密钥加载成功！当前加密密钥版本: " << g_keyMgr.getEncryptionVersion() << std::endl;
 
         // ============================================================
-        // 5. 初始化 DAO 和 QueryService
+        // 6. 初始化 QueryService
         // ============================================================
-        DAO dao;
-        QueryService qs(dao);
+        QueryService qs(dao, g_keyMgr);
+
+        // ============================================================
+        // 7. 定时轮换检查
+        // ============================================================
+        g_keyMgr.loadRotateTimeFromFile(ROTATE_TIME_FILE);
+        checkAndAutoRotate(dao);
 
         std::cout << "\n🎉 系统初始化完成！" << std::endl;
 
         // ============================================================
-        // 6. 主循环
+        // 8. 主循环
         // ============================================================
         int choice = -1;
         while (choice != 0) {
@@ -378,37 +512,22 @@ int main() {
             choice = getIntInput("请输入操作编号: ", -1);
 
             switch (choice) {
-                case 1:
-                    insertData(dao);
-                    break;
-                case 2:
-                    exactQuery(qs);
-                    break;
-                case 3:
-                    fuzzyQuery(qs);
-                    break;
-                case 4:
-                    updateData(dao);
-                    break;
-                case 5:
-                    deleteData(dao);
-                    break;
-                case 6:
-                    listAllRecords(dao);
-                    break;
-                case 0:
-                    std::cout << "👋 再见！" << std::endl;
-                    break;
-                default:
-                    std::cout << "❌ 无效选项，请输入 0-6。" << std::endl;
+                case 1: insertData(dao); break;
+                case 2: exactQuery(qs); break;
+                case 3: fuzzyQuery(qs); break;
+                case 4: updateData(dao); break;
+                case 5: deleteData(dao); break;
+                case 6: listAllRecords(dao); break;
+                case 7: keyManagement(dao); break;
+                case 0: std::cout << "👋 再见！" << std::endl; break;
+                default: std::cout << "❌ 无效选项，请输入 0-7。" << std::endl;
             }
         }
 
         // ============================================================
-        // 7. 清理资源
+        // 9. 清理
         // ============================================================
         getGlobalConnectionPool().closeAll();
-
         std::cout << "🔐 正在清理加密引擎..." << std::endl;
         CRYPT_EAL_Cleanup(CRYPT_EAL_INIT_ALL);
         std::cout << "✅ 加密引擎清理完成！" << std::endl;
@@ -417,7 +536,6 @@ int main() {
 
     } catch (const std::exception& e) {
         std::cerr << "\n❌ 程序启动失败: " << e.what() << std::endl;
-        std::cerr << "请检查数据库连接配置和密钥设置。" << std::endl;
         return 1;
     }
 }
