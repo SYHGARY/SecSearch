@@ -15,10 +15,10 @@ endif()
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -Wall -Wextra")
 set(CMAKE_CXX_FLAGS_RELEASE "-O2 -Wall -DNDEBUG")
 
-# ---- 设置可执行文件输出目录 ----
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/SecSearch)
+# ---- 可执行文件输出到项目根目录 ----
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR})
 
-# ---- 查找依赖库 ----
+# ========== 依赖库查找 ==========
 
 # 1. MySQL
 find_path(MYSQL_INCLUDE_DIR
@@ -45,48 +45,27 @@ find_library(ZSTD_LIBRARY
 # 5. boundscheck (OpenHiTLS 依赖，可选)
 find_library(BOUNDSCHECK_LIBRARY
     NAMES boundscheck
-    PATHS
-        ${CMAKE_SOURCE_DIR}/lib
-        /home/songyihang/openhitls/platform/Secure_C/build
-        /home/songyihang/libboundscheck/build
+    PATHS ${CMAKE_SOURCE_DIR}/lib
 )
 
 # 6. OpenHiTLS
 find_path(HITLS_INCLUDE_DIR
-    NAMES hitls/crypt_eal_cipher.h
-    PATHS
-        ${CMAKE_SOURCE_DIR}/hits
-        /usr/local/include
-        /usr/include
+    NAMES hitls/crypto/crypt_eal_cipher.h
+    PATHS ${CMAKE_SOURCE_DIR}/include /usr/local/include /usr/include
 )
 
 find_library(HITLS_CRYPTO_LIBRARY
     NAMES hitls_crypto
-    PATHS
-        ${CMAKE_SOURCE_DIR}/lib
-        /usr/local/lib
-        /usr/lib
+    PATHS ${CMAKE_SOURCE_DIR}/lib /usr/local/lib /usr/lib
 )
 
 find_library(HITLS_BSL_LIBRARY
     NAMES hitls_bsl
-    PATHS
-        ${CMAKE_SOURCE_DIR}/lib
-        /usr/local/lib
-        /usr/lib
+    PATHS ${CMAKE_SOURCE_DIR}/lib /usr/local/lib /usr/lib
 )
 
-# ---- 包含目录 ----
-include_directories(
-    ${CMAKE_SOURCE_DIR}/include
-    ${CMAKE_SOURCE_DIR}/hits
-    ${MYSQL_INCLUDE_DIR}
-    ${HITLS_INCLUDE_DIR}
-)
-
-# ---- 收集源文件 ----
-set(SRC_FILES
-    src/main.cpp
+# ========== 公共源码库（避免重复编译） ==========
+set(COMMON_SRC
     src/crypto/utils.cpp
     src/crypto/sm4_cipher.cpp
     src/crypto/sm3_hash.cpp
@@ -98,36 +77,64 @@ set(SRC_FILES
     src/query/query_service.cpp
 )
 
-# ---- 生成可执行文件 ----
-add_executable(SecSearch ${SRC_FILES})
+add_library(secsearch_common OBJECT ${COMMON_SRC})
 
-# ---- 链接库 ----
+target_include_directories(secsearch_common PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+    ${MYSQL_INCLUDE_DIR}
+    ${HITLS_INCLUDE_DIR}
+)
+
+# ========== 主程序 ==========
+add_executable(SecSearch src/main.cpp)
+
 target_link_libraries(SecSearch
+    secsearch_common
     ${HITLS_CRYPTO_LIBRARY}
     ${HITLS_BSL_LIBRARY}
     ${BOUNDSCHECK_LIBRARY}
     ${MYSQL_LIBRARY}
-    ${OPENSSL_LIBRARIES}
-    ${ZLIB_LIBRARIES}
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    ZLIB::ZLIB
     ${ZSTD_LIBRARY}
     pthread
     dl
 )
 
-# ---- 如果找不到 boundscheck，给出提示但不中断 ----
+# ========== 性能测试程序 ==========
+add_executable(benchmark_test src/tests/benchmark_test.cpp)
+
+target_link_libraries(benchmark_test
+    secsearch_common
+    ${HITLS_CRYPTO_LIBRARY}
+    ${HITLS_BSL_LIBRARY}
+    ${BOUNDSCHECK_LIBRARY}
+    ${MYSQL_LIBRARY}
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    ZLIB::ZLIB
+    ${ZSTD_LIBRARY}
+    pthread
+    dl
+)
+
+# ========== 配置检查与提示 ==========
 if(NOT BOUNDSCHECK_LIBRARY)
     message(WARNING "boundscheck library not found. If you see undefined references to __security_check_cookie or memcpy_s, please install libboundscheck.")
 endif()
 
-# ---- 如果找不到 OpenHiTLS，报错 ----
 if(NOT HITLS_CRYPTO_LIBRARY OR NOT HITLS_BSL_LIBRARY)
     message(FATAL_ERROR "OpenHiTLS libraries not found. Please check HITLS_CRYPTO_LIBRARY and HITLS_BSL_LIBRARY paths.")
 endif()
 
-# ---- 打印配置信息 ----
-message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
+# ========== 打印配置摘要 ==========
+message(STATUS "===== SecSearch Build Configuration =====")
+message(STATUS "Build type:    ${CMAKE_BUILD_TYPE}")
+message(STATUS "C++ standard:  ${CMAKE_CXX_STANDARD}")
 message(STATUS "MySQL include: ${MYSQL_INCLUDE_DIR}")
 message(STATUS "MySQL library: ${MYSQL_LIBRARY}")
-message(STATUS "OpenHiTLS include: ${HITLS_INCLUDE_DIR}")
+message(STATUS "OpenHiTLS inc: ${HITLS_INCLUDE_DIR}")
 message(STATUS "OpenHiTLS crypto: ${HITLS_CRYPTO_LIBRARY}")
-message(STATUS "OpenHiTLS bsl: ${HITLS_BSL_LIBRARY}")
+message(STATUS "OpenHiTLS bsl:    ${HITLS_BSL_LIBRARY}")
+message(STATUS "========================================")
