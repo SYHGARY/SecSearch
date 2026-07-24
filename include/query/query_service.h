@@ -1,16 +1,14 @@
 // query_service.h
-// 查询服务层
-
 #pragma once
 
 #include <vector>
 #include <string>
 #include <cstdint>
 #include "database/dao.h"
+#include "crypto/key_manager.h"
 
 namespace query {
 
-// ★ FullRecord 增加 encKeyVersion 字段
 struct FullRecord {
     int64_t id;
     std::string name;
@@ -19,10 +17,9 @@ struct FullRecord {
     int encKeyVersion;
 };
 
-// 查询服务类
 class QueryService {
 public:
-    explicit QueryService(database::DAO& dao);
+    explicit QueryService(database::DAO& dao, crypto::KeyManager& keyMgr);
 
     std::vector<FullRecord> exactQuery(
         const std::string& keyword,
@@ -42,12 +39,21 @@ public:
 
 private:
     database::DAO& dao_;
+    crypto::KeyManager& keyMgr_;
 
+    // ---- 新声明：按版本验证 Tag ----
+    bool verifyTagWithVersion(const std::string& cipher,
+                              const std::string& tag,
+                              int version,
+                              const std::vector<unsigned char>& fallbackKey);
+
+    // 原有的 verifyTag 可以保留或移除，这里我们保留但不使用，或者删除
     bool verifyTag(const std::string& cipher, const std::string& tag,
                    const std::vector<unsigned char>& tagKey);
 
-    std::string decryptField(const std::string& cipher,
-                             const std::vector<unsigned char>& encKey);
+    std::string decryptFieldWithVersion(const std::string& cipher,
+                                        int version,
+                                        const std::vector<unsigned char>& fallbackKey);
 
     FullRecord buildFullRecord(
         int64_t id,
@@ -55,8 +61,8 @@ private:
         const std::string& phoneCipher, const std::string& phoneTag,
         const std::string& addrCipher, const std::string& addrTag,
         int encKeyVersion,
-        const std::vector<unsigned char>& encKey,
-        const std::vector<unsigned char>& tagKey
+        const std::vector<unsigned char>& fallbackEncKey,
+        const std::vector<unsigned char>& fallbackTagKey
     );
 
     std::vector<FullRecord> fetchFullRecords(
@@ -68,7 +74,6 @@ private:
     );
 };
 
-// ★ 辅助结构体：增加 encKeyVersion
 struct FullRecordBuilder {
     int64_t id;
     int encKeyVersion;

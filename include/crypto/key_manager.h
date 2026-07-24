@@ -1,6 +1,6 @@
 // key_manager.h
-// 四密钥管理器：加密密钥、索引密钥、完整性密钥 + 密钥版本管理
-// 基于 OpenHiTLS 实现
+// 四密钥管理器：支持多版本存储、轮换、状态管理
+// 支持获取所有历史版本密钥用于多版本查询
 
 #pragma once
 
@@ -8,32 +8,47 @@
 #include <string>
 #include <map>
 #include <mutex>
+#include <chrono>
+
+namespace database {
+    class DAO;  // 前向声明
+}
 
 namespace crypto {
 
-// ---- 密钥状态枚举 ----
 enum class KeyStatus : uint8_t {
-    ENABLED = 1,      // 启用
-    DISABLED = 2,     // 停用（仅可解密历史数据）
-    DESTROYED = 3     // 销毁
+    ENABLED = 1,
+    DISABLED = 2,
+    DESTROYED = 3
 };
 
-// ---- 单个密钥信息 ----
 struct KeyInfo {
-    std::vector<unsigned char> key;   // 密钥数据（16字节）
-    int version;                      // 版本号
-    KeyStatus status;                 // 状态
+    std::vector<unsigned char> key;
+    int version;
+    KeyStatus status;
 };
 
-// ---- 密钥管理器 ----
 class KeyManager {
 public:
     // ---- 初始化 ----
-    // 设置主密钥 KEK（用于解密存储的密钥密文）
     void init(const std::vector<unsigned char>& kek);
 
-    // ---- 加载密钥 ----
-    // 从数据库加载三个密钥的密文（Base64），用 KEK 解密
+    // ---- ★ 从数据库加载所有历史密钥 ----
+    void loadFromDatabase(database::DAO& dao, const std::vector<unsigned char>& kek);
+
+    // ---- ★ 保存密钥到数据库 ----
+    void saveToDatabase(database::DAO& dao, int type,
+                        const std::vector<unsigned char>& key,
+                        int version, KeyStatus status);
+
+    // ---- 解密工作密钥密文（供从数据库加载） ----
+    std::vector<unsigned char> decryptDEK(const std::string& cipherBase64);
+
+    // ---- 添加密钥（从数据库加载时使用） ----
+    void addKey(int type, const std::vector<unsigned char>& key, int version, KeyStatus status);
+    void clearKeys();
+
+    // ---- 静态加载（测试用） ----
     void loadKeys(const std::string& encryptedEncKey,
                   const std::string& encryptedIdxKey,
                   const std::string& encryptedTagKey,
@@ -41,12 +56,12 @@ public:
                   int idxVersion = 1,
                   int tagVersion = 1);
 
-    // ---- 获取当前启用版本的密钥（返回引用，直接指向内部存储） ----
+    // ---- 获取当前启用版本 ----
     const std::vector<unsigned char>& getEncryptionKey() const;
     const std::vector<unsigned char>& getIndexKey() const;
     const std::vector<unsigned char>& getTagKey() const;
 
-    // ---- 获取密钥信息（返回 const 引用，避免拷贝和临时对象） ----
+    // ---- 获取密钥信息 ----
     const KeyInfo& getEncryptionKeyInfo() const;
     const KeyInfo& getIndexKeyInfo() const;
     const KeyInfo& getTagKeyInfo() const;
@@ -56,10 +71,20 @@ public:
     bool getIndexKeyByVersion(int version, std::vector<unsigned char>& key) const;
     bool getTagKeyByVersion(int version, std::vector<unsigned char>& key) const;
 
+    // ---- 获取所有历史版本号 ----
+    std::vector<int> getAllEncryptionVersions() const;
+    std::vector<int> getAllIndexVersions() const;
+    std::vector<int> getAllTagVersions() const;
+
+    // ---- 获取所有版本密钥 ----
+    std::vector<std::pair<int, std::vector<unsigned char>>> getAllEncryptionKeys() const;
+    std::vector<std::pair<int, std::vector<unsigned char>>> getAllIndexKeys() const;
+    std::vector<std::pair<int, std::vector<unsigned char>>> getAllTagKeys() const;
+
     // ---- 密钥轮换 ----
-    void rotateEncryptionKey();
-    void rotateIndexKey();
-    void rotateTagKey();
+    int rotateEncryptionKey();
+    int rotateIndexKey();
+    int rotateTagKey();
 
     // ---- 密钥状态管理 ----
     void setKeyStatus(int type, int version, KeyStatus status);
@@ -75,31 +100,36 @@ public:
     bool isIndexKeyActive() const;
     bool isTagKeyActive() const;
 
+    // ---- 获取 KEK ----
+    const std::vector<unsigned char>& getKEK() const { return kek_; }
+
+    // ---- 轮换时间管理 ----
+    std::chrono::system_clock::time_point getLastRotateTime() const;
+    void setLastRotateTime(std::chrono::system_clock::time_point time);
+    void saveRotateTimeToFile(const std::string& filename);
+    void loadRotateTimeFromFile(const std::string& filename);
+
 private:
-    // 密钥类型常量
     enum KeyType { KEY_TYPE_ENC = 1, KEY_TYPE_IDX = 2, KEY_TYPE_TAG = 3 };
 
-    std::vector<unsigned char> kek_;          // 主密钥
-    mutable std::mutex mutex_;                // 线程安全
+    std::vector<unsigned char> kek_;
+    mutable std::mutex mutex_;
 
-    // 密钥存储：类型 -> 版本 -> 密钥信息
+    // 每种类型按版本号存储所有历史密钥
     std::map<int, KeyInfo> keys_[3];
 
-    // 当前启用版本
     int currentEncVersion_ = 0;
     int currentIdxVersion_ = 0;
     int currentTagVersion_ = 0;
 
     bool initialized_ = false;
+    std::chrono::system_clock::time_point lastRotateTime_;
 
-    // ---- 内部方法 ----
-    std::vector<unsigned char> decryptDEK(const std::string& cipherBase64);
     void addKeyVersion(int type, const std::vector<unsigned char>& key,
                        int version, KeyStatus status);
-
-    // ★ 返回 const 引用，指向 keys_ 中存储的对象，生命周期安全
     const KeyInfo& getCurrentKeyInfo(int type) const;
-    void rotateKey(int type);
+    int rotateKey(int type);
+    int getCurrentVersion(int type) const;
 };
 
 } // namespace crypto
