@@ -6,6 +6,7 @@
 #include "crypto/sm4_cipher.h"
 #include "crypto/hmac_sm3.h"
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <algorithm>
 #include <iostream>
@@ -35,7 +36,6 @@ std::string QueryService::decryptFieldWithVersion(const std::string& cipher,
             return std::string(plainBytes.begin(), plainBytes.end());
         } catch (...) { /* 失败则尝试 fallback */ }
     }
-    // 找不到或失败，使用 fallback（当前版本）
     auto plainBytes = crypto::Sm4Cipher::decrypt(cipher, fallbackKey);
     return std::string(plainBytes.begin(), plainBytes.end());
 }
@@ -126,7 +126,6 @@ std::vector<FullRecord> QueryService::fetchFullRecords(
     // ============================================================
     decrypt::BatchDecryptor batchDecryptor(dao_, keyMgr_);
 
-    // 显示进度（如果记录数较多）
     bool showProgress = (allCipherRecords.size() > 20);
 
     auto decryptResults = batchDecryptor.decryptRecords(
@@ -146,8 +145,6 @@ std::vector<FullRecord> QueryService::fetchFullRecords(
     // ============================================================
     // 步骤5：将解密结果按 (ID, fieldType) 缓存
     // ============================================================
-    // 由于 DecryptResult 包含 id 和 plaintext，但缺少 fieldType，
-    // 我们通过 allCipherRecords 的索引来匹配
     std::map<int64_t, std::map<database::FieldType, std::string>> decryptedCache;
 
     for (size_t i = 0; i < decryptResults.size(); ++i) {
@@ -170,7 +167,6 @@ std::vector<FullRecord> QueryService::fetchFullRecords(
         rec.id = b.id;
         rec.encKeyVersion = b.encKeyVersion;
 
-        // ★ 从缓存中获取明文
         auto idIt = decryptedCache.find(b.id);
         if (idIt != decryptedCache.end()) {
             auto& fieldMap = idIt->second;
@@ -182,7 +178,6 @@ std::vector<FullRecord> QueryService::fetchFullRecords(
             if (it != fieldMap.end()) rec.address = it->second;
         }
 
-        // 如果缓存中没有（解密失败），尝试用 fallback
         if (rec.name.empty() && !b.nameCipher.empty()) {
             rec.name = decryptFieldWithVersion(b.nameCipher, b.encKeyVersion, encKey);
         }
@@ -193,7 +188,6 @@ std::vector<FullRecord> QueryService::fetchFullRecords(
             rec.address = decryptFieldWithVersion(b.addrCipher, b.encKeyVersion, encKey);
         }
 
-        // 碰撞消解
         if (expectedPlain) {
             bool match = false;
             switch (fieldType) {
@@ -226,27 +220,23 @@ std::vector<FullRecord> QueryService::exactQuery(
 
     auto keywordBytes = std::vector<unsigned char>(keyword.begin(), keyword.end());
 
-    // ★ 获取所有历史版本的索引密钥
     auto allIdxKeys = keyMgr_.getAllIndexKeys();
 
-    // ★ 用所有版本分别计算盲索引
     std::vector<std::string> blindHashes;
     for (const auto& pair : allIdxKeys) {
         blindHashes.push_back(crypto::HmacSm3::hmacHex(keywordBytes, pair.second));
     }
 
-    // ★ 去重
     std::sort(blindHashes.begin(), blindHashes.end());
     blindHashes.erase(std::unique(blindHashes.begin(), blindHashes.end()), blindHashes.end());
 
-    // ★ 多版本查询
     std::vector<int64_t> ids = dao_.queryByExactIndexMulti(blindHashes, fieldType);
     if (ids.empty()) return {};
 
     return fetchFullRecords(ids, encKey, tagKey, fieldType, &keyword);
 }
 
-// ---- 模糊查询（多版本 token 匹配） ----
+// ---- ★ 模糊查询（多版本 token 匹配，分别查询每个版本） ----
 std::vector<FullRecord> QueryService::fuzzyQuery(
     const std::string& keyword,
     database::FieldType fieldType,
@@ -260,22 +250,28 @@ std::vector<FullRecord> QueryService::fuzzyQuery(
     // ★ 获取所有历史版本的索引密钥
     auto allIdxKeys = keyMgr_.getAllIndexKeys();
 
-    // ★ 用所有版本分别计算每个 token 的哈希
-    std::vector<std::string> allHashes;
-    for (const auto& token : tokens) {
-        auto tokenBytes = std::vector<unsigned char>(token.begin(), token.end());
-        for (const auto& pair : allIdxKeys) {
-            allHashes.push_back(crypto::HmacSm3::hmacHex(tokenBytes, pair.second));
+    // ★ 使用集合去重 ID
+    std::set<int64_t> idSet;
+
+    // ★ 对每个索引密钥版本，分别计算 token 哈希并查询
+    for (const auto& pair : allIdxKeys) {
+        const auto& key = pair.second;
+        std::vector<std::string> versionHashes;
+        for (const auto& token : tokens) {
+            auto tokenBytes = std::vector<unsigned char>(token.begin(), token.end());
+            versionHashes.push_back(crypto::HmacSm3::hmacHex(tokenBytes, key));
+        }
+
+        // 查询该版本的结果
+        auto ids = dao_.queryByFuzzyKeywordMulti(versionHashes, fieldType);
+        for (auto id : ids) {
+            idSet.insert(id);
         }
     }
 
-    // ★ 去重
-    std::sort(allHashes.begin(), allHashes.end());
-    allHashes.erase(std::unique(allHashes.begin(), allHashes.end()), allHashes.end());
+    if (idSet.empty()) return {};
 
-    // ★ 多版本模糊查询
-    std::vector<int64_t> ids = dao_.queryByFuzzyKeywordMulti(allHashes, fieldType);
-    if (ids.empty()) return {};
+    std::vector<int64_t> ids(idSet.begin(), idSet.end());
 
     auto results = fetchFullRecords(ids, encKey, tagKey, fieldType, nullptr);
 

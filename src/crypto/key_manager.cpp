@@ -65,22 +65,22 @@ void KeyManager::loadFromDatabase(database::DAO& dao, const std::vector<unsigned
     currentIdxVersion_ = 0;
     currentTagVersion_ = 0;
 
-    std::cout << "[KeyManager] Loading keys from database..." << std::endl;
+    // std::cout << "[KeyManager] Loading keys from database..." << std::endl;
 
     // 从数据库加载三种类型的密钥
     for (int type = 1; type <= 3; ++type) {
-        std::cout << "[KeyManager] Loading type " << type << std::endl;
+        // std::cout << "[KeyManager] Loading type " << type << std::endl;
         auto records = dao.loadAllKeysFromConfig(type);
-        std::cout << "[KeyManager] Found " << records.size() << " records for type " << type << std::endl;
+        // std::cout << "[KeyManager] Found " << records.size() << " records for type " << type << std::endl;
 
         for (const auto& rec : records) {
-            std::cout << "[KeyManager] Processing type " << type << " version " << rec.version
-                      << " status " << static_cast<int>(rec.status) << std::endl;
+            // std::cout << "[KeyManager] Processing type " << type << " version " << rec.version
+            //           << " status " << static_cast<int>(rec.status) << std::endl;
 
             try {
                 // ★ 用 KEK 解密密文（rec.key 是十六进制字符串的 ASCII 字节）
                 std::string cipherHex(rec.key.begin(), rec.key.end());
-                std::cout << "[KeyManager] cipherHex length: " << cipherHex.size() << std::endl;
+                // std::cout << "[KeyManager] cipherHex length: " << cipherHex.size() << std::endl;
                 auto decrypted = Sm4Cipher::decrypt(cipherHex, kek);
                 if (decrypted.size() != 16) {
                     std::cerr << "Warning: Decrypted key length " << decrypted.size()
@@ -93,7 +93,7 @@ void KeyManager::loadFromDatabase(database::DAO& dao, const std::vector<unsigned
                 info.version = rec.version;
                 info.status = rec.status;
                 keys_[type - 1][rec.version] = info;
-                std::cout << "[KeyManager] Successfully loaded type " << type << " version " << rec.version << std::endl;
+                // std::cout << "[KeyManager] Successfully loaded type " << type << " version " << rec.version << std::endl;
 
                 // 更新当前版本（取状态为启用的最大版本号）
                 if (rec.status == KeyStatus::ENABLED) {
@@ -114,15 +114,15 @@ void KeyManager::loadFromDatabase(database::DAO& dao, const std::vector<unsigned
         }
     }
 
-    std::cout << "[KeyManager] Load complete. Encryption versions: ";
-    for (const auto& p : keys_[0]) std::cout << p.first << " ";
-    std::cout << std::endl;
-    std::cout << "[KeyManager] Index versions: ";
-    for (const auto& p : keys_[1]) std::cout << p.first << " ";
-    std::cout << std::endl;
-    std::cout << "[KeyManager] Tag versions: ";
-    for (const auto& p : keys_[2]) std::cout << p.first << " ";
-    std::cout << std::endl;
+    // std::cout << "[KeyManager] Load complete. Encryption versions: ";
+    // for (const auto& p : keys_[0]) std::cout << p.first << " ";
+    // std::cout << std::endl;
+    // std::cout << "[KeyManager] Index versions: ";
+    // for (const auto& p : keys_[1]) std::cout << p.first << " ";
+    // std::cout << std::endl;
+    // std::cout << "[KeyManager] Tag versions: ";
+    // for (const auto& p : keys_[2]) std::cout << p.first << " ";
+    // std::cout << std::endl;
 
     // 检查是否成功加载至少一个有效版本（三种类型都必须有）
     if (keys_[0].empty() || keys_[1].empty() || keys_[2].empty()) {
@@ -138,7 +138,7 @@ void KeyManager::saveToDatabase(database::DAO& dao, int type,
     auto cipher = Sm4Cipher::encrypt(key, kek_);
     std::vector<unsigned char> cipherBytes(cipher.begin(), cipher.end());
     dao.saveKeyToConfig(type, cipherBytes, version, status);
-    std::cout << "[KeyManager] Saved key type " << type << " version " << version << " to database" << std::endl;
+    // std::cout << "[KeyManager] Saved key type " << type << " version " << version << " to database" << std::endl;
 }
 
 void KeyManager::loadKeys(const std::string& encryptedEncKey,

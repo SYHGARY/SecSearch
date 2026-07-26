@@ -1,8 +1,11 @@
 // utils.cpp
-// 自实现 Base64 (RFC 4648) 和十六进制转换
+// 自实现 Base64 (RFC 4648) 和十六进制转换，以及密钥文件读取
 
 #include "crypto/utils.h"
 #include <stdexcept>
+#include <fstream>
+#include <cctype>
+#include <algorithm>
 
 namespace crypto {
 
@@ -107,6 +110,48 @@ std::vector<unsigned char> hexToBin(const std::string& hex) {
         out[i/2] = (val(hex[i]) << 4) | val(hex[i+1]);
     }
     return out;
+}
+
+// ---- ★ 从文件读取十六进制密钥 ----
+std::vector<unsigned char> readKeyFromFile(const std::string& filepath) {
+    // 1. 打开文件
+    std::ifstream file(filepath);
+    if (!file.is_open()) {
+        throw std::runtime_error("Cannot open key file: " + filepath);
+    }
+
+    // 2. 读取所有内容（支持多行，忽略空白字符）
+    std::string content;
+    std::string line;
+    while (std::getline(file, line)) {
+        content += line;
+    }
+    file.close();
+
+    // 3. 去掉所有空白字符（空格、换行、制表符）
+    content.erase(std::remove_if(content.begin(), content.end(), ::isspace), content.end());
+
+    // 4. 检查内容是否为空
+    if (content.empty()) {
+        throw std::runtime_error("Key file is empty: " + filepath);
+    }
+
+    // 5. 检查长度（16字节 = 32个十六进制字符）
+    if (content.size() != 32) {
+        throw std::runtime_error("Invalid key length in file: expected 32 hex characters (16 bytes), got " +
+                                 std::to_string(content.size()));
+    }
+
+    // 6. 尝试转换为二进制
+    try {
+        auto keyBytes = hexToBin(content);
+        if (keyBytes.size() != 16) {
+            throw std::runtime_error("Decoded key length is not 16 bytes");
+        }
+        return keyBytes;
+    } catch (const std::exception& e) {
+        throw std::runtime_error("Invalid hex format in key file: " + std::string(e.what()));
+    }
 }
 
 } // namespace crypto

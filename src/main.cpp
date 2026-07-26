@@ -1,6 +1,7 @@
 // main.cpp
 // 交互式命令行程序，提供增删改查功能
 // 支持密钥多版本管理、主动轮换、定时轮换、持久化到 key_config 表
+// 主密钥 KEK 从密钥文件读取，不再硬编码
 // 基于 OpenHiTLS 加密库
 
 #include "database/dao.h"
@@ -9,6 +10,7 @@
 #include "crypto/key_manager.h"
 #include "crypto/sm4_cipher.h"
 #include "crypto/hmac_sm3.h"
+#include "crypto/utils.h"
 
 #include <hitls/crypto/crypt_eal_init.h>
 #include <hitls/crypto/crypt_errno.h>
@@ -20,6 +22,9 @@
 #include <iomanip>
 #include <cstring>
 #include <chrono>
+#include <cstdlib>
+#include <fstream>
+#include <algorithm>
 
 #ifdef _WIN32
     #include <conio.h>
@@ -40,6 +45,15 @@ std::vector<unsigned char> g_tagKey;
 // ---- 定时轮换配置 ----
 const int AUTO_ROTATE_DAYS = 90;
 const std::string ROTATE_TIME_FILE = ".key_rotate_time";
+
+// ---- ★ 密钥文件搜索路径 ----
+const std::vector<std::string> KEK_SEARCH_PATHS = {
+    "/etc/secsearch/kek.key",
+    "/usr/local/etc/secsearch/kek.key",
+    "/home/songyihang/.secsearch/kek.key",
+    "./kek.key",
+    "./.kek.key"
+};
 
 // ---- 辅助函数 ----
 
@@ -138,7 +152,19 @@ void printFullRecords(const std::vector<FullRecord>& results) {
     std::cout << "+-----+------------------+------------------+----------------------------------------+-------+" << std::endl;
 }
 
-// ---- ★ 定时轮换检查和执行（需要 DAO 引用） ----
+// ---- ★ 查找密钥文件 ----
+std::string findKEKFile() {
+    for (const auto& path : KEK_SEARCH_PATHS) {
+        std::ifstream test(path);
+        if (test.is_open()) {
+            test.close();
+            return path;
+        }
+    }
+    return "";
+}
+
+// ---- 定时轮换检查和执行 ----
 bool checkAndAutoRotate(database::DAO& dao) {
     g_keyMgr.loadRotateTimeFromFile(ROTATE_TIME_FILE);
     auto lastTime = g_keyMgr.getLastRotateTime();
@@ -154,7 +180,6 @@ bool checkAndAutoRotate(database::DAO& dao) {
             int newIdxVer = g_keyMgr.rotateIndexKey();
             int newTagVer = g_keyMgr.rotateTagKey();
 
-            // ★ 保存新密钥到数据库
             auto encKey = g_keyMgr.getEncryptionKey();
             auto idxKey = g_keyMgr.getIndexKey();
             auto tagKey = g_keyMgr.getTagKey();
@@ -181,7 +206,7 @@ bool checkAndAutoRotate(database::DAO& dao) {
     return false;
 }
 
-// ---- ★ 主动密钥管理（传入 DAO 引用） ----
+// ---- ★ 密钥管理 ----
 void keyManagement(database::DAO& dao) {
     std::cout << "\n========== 🔑 密钥管理 ==========" << std::endl;
     std::cout << "当前加密密钥版本: " << g_keyMgr.getEncryptionVersion() << " (启用)" << std::endl;
@@ -399,8 +424,8 @@ void showMenu() {
     std::cout << "║  3. 模糊查询（中缀匹配）                                   ║" << std::endl;
     std::cout << "║  4. 更新数据                                              ║" << std::endl;
     std::cout << "║  5. 删除数据                                              ║" << std::endl;
-    std::cout << "║  6. 查看所有记录（调试）                                   ║" << std::endl;
-    std::cout << "║  7. 🔑 密钥管理（轮换/状态）                               ║" << std::endl;
+    std::cout << "║  6. 查看所有记录                                          ║" << std::endl;
+    std::cout << "║  7. 🔑 密钥管理                                           ║" << std::endl;
     std::cout << "║  0. 退出                                                  ║" << std::endl;
     std::cout << "╚═══════════════════════════════════════════════════════════╝" << std::endl;
 }
@@ -444,21 +469,48 @@ int main() {
         std::cout << "✅ 数据库连接成功！" << std::endl;
 
         // ============================================================
-        // 4. 初始化 DAO（用于密钥加载和后续操作）
+        // 4. 初始化 DAO
         // ============================================================
         DAO dao;
 
         // ============================================================
-        // 5. 初始化密钥管理器（从 key_config 表加载）
+        // 5. ★ 查找并加载 KEK 密钥文件
+        // ============================================================
+        std::cout << "\n🔑 正在加载主密钥..." << std::endl;
+
+        std::string kekFilePath = findKEKFile();
+        if (kekFilePath.empty()) {
+            std::cerr << "❌ 未找到密钥文件" << std::endl;
+            std::cerr << "请在以下位置之一放置密钥文件：" << std::endl;
+            for (const auto& path : KEK_SEARCH_PATHS) {
+                std::cerr << "  " << path << std::endl;
+            }
+            std::cerr << "\n生成命令: openssl rand -hex 16 > ~/.secsearch/kek.key" << std::endl;
+            std::cerr << "（注意：需要先创建目录 mkdir -p ~/.secsearch）" << std::endl;
+            return 1;
+        }
+
+        std::cout << "📍 密钥文件位置: " << kekFilePath << std::endl;
+
+        // ---- ★ 从文件读取 KEK ----
+        std::vector<unsigned char> kek;
+        try {
+            kek = crypto::readKeyFromFile(kekFilePath);
+            std::cout << "✅ KEK 加载成功（16 字节）" << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "❌ " << e.what() << std::endl;
+            return 1;
+        }
+
+        // ============================================================
+        // 6. 初始化密钥管理器（从 key_config 表加载）
         // ============================================================
         std::cout << "🔑 正在从 key_config 表加载密钥..." << std::endl;
 
-        // 主密钥 KEK（实际应来自环境变量或安全配置）
-        std::vector<unsigned char> kek(16, 0x11);
         g_keyMgr.init(kek);
 
+        // ---- ★ 从 key_config 表加载所有历史密钥 ----
         try {
-            // ★ 从数据库加载所有历史密钥
             g_keyMgr.loadFromDatabase(dao, kek);
             std::cout << "✅ 从 key_config 加载成功！" << std::endl;
             std::cout << "   加密密钥版本数: " << g_keyMgr.getAllEncryptionVersions().size() << std::endl;
@@ -469,17 +521,15 @@ int main() {
             std::cerr << "❌ 从 key_config 加载失败: " << e.what() << std::endl;
             std::cerr << "   正在初始化初始密钥..." << std::endl;
 
-            // ★ 初始化三组密钥（第一次运行时）
+            // 初始化三组密钥（第一次运行时）
             std::vector<unsigned char> initEnc(16, 0xA0);
             std::vector<unsigned char> initIdx(16, 0xB0);
             std::vector<unsigned char> initTag(16, 0xC0);
 
-            // 加密后存入 key_config
             g_keyMgr.saveToDatabase(dao, 1, initEnc, 1, crypto::KeyStatus::ENABLED);
             g_keyMgr.saveToDatabase(dao, 2, initIdx, 1, crypto::KeyStatus::ENABLED);
             g_keyMgr.saveToDatabase(dao, 3, initTag, 1, crypto::KeyStatus::ENABLED);
 
-            // 重新加载
             g_keyMgr.loadFromDatabase(dao, kek);
             std::cout << "✅ 初始密钥已生成并保存到 key_config" << std::endl;
         }
@@ -491,12 +541,12 @@ int main() {
         std::cout << "✅ 密钥加载成功！当前加密密钥版本: " << g_keyMgr.getEncryptionVersion() << std::endl;
 
         // ============================================================
-        // 6. 初始化 QueryService
+        // 7. 初始化 QueryService
         // ============================================================
         QueryService qs(dao, g_keyMgr);
 
         // ============================================================
-        // 7. 定时轮换检查
+        // 8. 定时轮换检查
         // ============================================================
         g_keyMgr.loadRotateTimeFromFile(ROTATE_TIME_FILE);
         checkAndAutoRotate(dao);
@@ -504,7 +554,7 @@ int main() {
         std::cout << "\n🎉 系统初始化完成！" << std::endl;
 
         // ============================================================
-        // 8. 主循环
+        // 9. 主循环
         // ============================================================
         int choice = -1;
         while (choice != 0) {
@@ -525,7 +575,7 @@ int main() {
         }
 
         // ============================================================
-        // 9. 清理
+        // 10. 清理
         // ============================================================
         getGlobalConnectionPool().closeAll();
         std::cout << "🔐 正在清理加密引擎..." << std::endl;
