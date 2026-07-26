@@ -75,6 +75,7 @@ set(COMMON_SRC
     src/database/transaction.cpp
     src/database/dao.cpp
     src/query/query_service.cpp
+    src/decrypt/batch_decryptor.cpp
 )
 
 add_library(secsearch_common OBJECT ${COMMON_SRC})
