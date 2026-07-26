@@ -1,4 +1,6 @@
 // query_service.h
+// 查询服务层：支持精确查询和模糊查询，集成批量解密流水线
+
 #pragma once
 
 #include <vector>
@@ -9,18 +11,23 @@
 
 namespace query {
 
+// ---- 完整记录 ----
 struct FullRecord {
     int64_t id;
     std::string name;
     std::string phone;
     std::string address;
-    int encKeyVersion;
+    int encKeyVersion;          // 加密密钥版本号
 };
 
+// ---- 查询服务类 ----
 class QueryService {
 public:
-    explicit QueryService(database::DAO& dao, crypto::KeyManager& keyMgr);
+    // 构造函数：需要 DAO 和 KeyManager 引用
+    QueryService(database::DAO& dao, crypto::KeyManager& keyMgr);
 
+    // ---- 精确查询（等值匹配） ----
+    // 支持多版本盲索引匹配，自动遍历所有历史索引密钥
     std::vector<FullRecord> exactQuery(
         const std::string& keyword,
         database::FieldType fieldType,
@@ -29,6 +36,8 @@ public:
         const std::vector<unsigned char>& tagKey
     );
 
+    // ---- 模糊查询（中缀匹配） ----
+    // 支持多版本 token 匹配，自动遍历所有历史索引密钥
     std::vector<FullRecord> fuzzyQuery(
         const std::string& keyword,
         database::FieldType fieldType,
@@ -41,20 +50,16 @@ private:
     database::DAO& dao_;
     crypto::KeyManager& keyMgr_;
 
-    // ---- 新声明：按版本验证 Tag ----
-    bool verifyTagWithVersion(const std::string& cipher,
-                              const std::string& tag,
-                              int version,
-                              const std::vector<unsigned char>& fallbackKey);
-
-    // 原有的 verifyTag 可以保留或移除，这里我们保留但不使用，或者删除
+    // ---- 验证完整性 Tag ----
     bool verifyTag(const std::string& cipher, const std::string& tag,
                    const std::vector<unsigned char>& tagKey);
 
+    // ---- 按版本解密（fallback） ----
     std::string decryptFieldWithVersion(const std::string& cipher,
                                         int version,
                                         const std::vector<unsigned char>& fallbackKey);
 
+    // ---- 构建完整记录 ----
     FullRecord buildFullRecord(
         int64_t id,
         const std::string& nameCipher, const std::string& nameTag,
@@ -62,9 +67,10 @@ private:
         const std::string& addrCipher, const std::string& addrTag,
         int encKeyVersion,
         const std::vector<unsigned char>& fallbackEncKey,
-        const std::vector<unsigned char>& fallbackTagKey
+        const std::vector<unsigned char>& tagKey
     );
 
+    // ---- ★ 核心方法：获取完整记录（集成生产者-消费者批量解密） ----
     std::vector<FullRecord> fetchFullRecords(
         const std::vector<int64_t>& ids,
         const std::vector<unsigned char>& encKey,
@@ -74,6 +80,7 @@ private:
     );
 };
 
+// ---- 辅助结构体：用于构建完整记录 ----
 struct FullRecordBuilder {
     int64_t id;
     int encKeyVersion;
