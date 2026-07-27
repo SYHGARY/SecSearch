@@ -51,6 +51,7 @@ SecSearch/
 | CMake | 3.16+ |
 | MySQL | 8.0+ |
 | OpenSSL | 1.1+ |
+| OpenHiTLS | 链接库已在项目lib中 |
 
 ## 快速开始
 
