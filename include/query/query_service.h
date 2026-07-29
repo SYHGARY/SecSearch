@@ -1,5 +1,6 @@
 // query_service.h
 // 查询服务层：支持精确查询和模糊查询，集成批量解密流水线
+// 集成安全审计模块
 
 #pragma once
 
@@ -8,6 +9,11 @@
 #include <cstdint>
 #include "database/dao.h"
 #include "crypto/key_manager.h"
+
+// ★ 前向声明审计模块
+namespace audit {
+    class AuditLogger;
+}
 
 namespace query {
 
@@ -23,8 +29,10 @@ struct FullRecord {
 // ---- 查询服务类 ----
 class QueryService {
 public:
-    // 构造函数：需要 DAO 和 KeyManager 引用
-    QueryService(database::DAO& dao, crypto::KeyManager& keyMgr);
+    // ★ 构造函数：增加审计日志器（可选）
+    QueryService(database::DAO& dao,
+                 crypto::KeyManager& keyMgr,
+                 audit::AuditLogger* auditLogger = nullptr);
 
     // ---- 精确查询（等值匹配） ----
     // 支持多版本盲索引匹配，自动遍历所有历史索引密钥
@@ -49,6 +57,7 @@ public:
 private:
     database::DAO& dao_;
     crypto::KeyManager& keyMgr_;
+    audit::AuditLogger* auditLogger_;   // 审计日志器（可为空）
 
     // ---- 验证完整性 Tag ----
     bool verifyTag(const std::string& cipher, const std::string& tag,

@@ -1,6 +1,7 @@
 // batch_decryptor.h
 // 批量解密服务：生产者-消费者流水线模型
 // 支持直接传入 CipherRecord 列表进行并发解密
+// 集成安全审计模块
 
 #pragma once
 
@@ -13,6 +14,11 @@
 #include <queue>
 #include "database/dao.h"
 #include "crypto/key_manager.h"
+
+// ★ 前向声明审计模块
+namespace audit {
+    class AuditLogger;
+}
 
 namespace decrypt {
 
@@ -39,16 +45,24 @@ public:
     BatchDecryptor(database::DAO& dao, crypto::KeyManager& keyMgr);
 
     // ---- ★ 核心方法：解密 CipherRecord 列表（生产者-消费者） ----
-    // 参数：密文记录列表、进度回调（可选）
+    // 参数：
+    //   records     : 密文记录列表
+    //   requestId   : 请求唯一标识（用于关联审计日志）
+    //   auditLogger : 审计日志器（可为空）
+    //   progressCb  : 进度回调（可选）
     // 返回：解密结果列表（与输入顺序一致）
     std::vector<DecryptResult> decryptRecords(
         const std::vector<database::CipherRecord>& records,
+        const std::string& requestId,
+        audit::AuditLogger* auditLogger = nullptr,
         std::function<void(size_t, size_t)> progressCb = nullptr
     );
 
     // ---- 批量解密（从数据库读取） ----
     std::vector<DecryptResult> decryptBatch(
         const std::vector<int64_t>& ids,
+        const std::string& requestId,
+        audit::AuditLogger* auditLogger = nullptr,
         std::function<void(size_t, size_t)> progressCb = nullptr
     );
 
@@ -57,6 +71,8 @@ public:
 private:
     database::DAO& dao_;
     crypto::KeyManager& keyMgr_;
+    audit::AuditLogger* auditLogger_ = nullptr;   // ★ 当前请求的审计器（由主线程传入）
+    std::string currentRequestId_;                // ★ 当前请求ID
     DecryptStats lastStats_;
 
     // ---- 解密单个密文 ----
