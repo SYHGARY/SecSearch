@@ -6,7 +6,7 @@ CREATE DATABASE IF NOT EXISTS secsearch;
 -- 2. 使用正确的数据库
 USE secsearch;
 
--- 3. 创建主数据表（含 enc_key_version 字段）
+-- 3. 创建主数据表
 CREATE TABLE IF NOT EXISTS `sensitive_data` (
   `id` bigint(20) NOT NULL AUTO_INCREMENT COMMENT '主键ID',
   `enc_key_version` int(11) NOT NULL DEFAULT 1 COMMENT '加密密钥版本号',
@@ -52,3 +52,32 @@ CREATE TABLE IF NOT EXISTS `key_config` (
   PRIMARY KEY (`key_id`),
   UNIQUE KEY `uk_type_version` (`key_type`, `key_version`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='密钥配置表';
+
+-- 6. 审计日志表
+CREATE TABLE IF NOT EXISTS audit_log (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    request_id VARCHAR(64) NOT NULL COMMENT '请求唯一标识',
+    operator VARCHAR(64) DEFAULT 'system' COMMENT '操作者（可扩展）',
+    operation VARCHAR(32) NOT NULL COMMENT '操作类型: INSERT/EXACT_QUERY/FUZZY_QUERY/UPDATE/DELETE/BATCH_DECRYPT',
+    field_code TINYINT COMMENT '字段类型: 1-姓名 2-手机号 3-地址',
+    candidate_count INT DEFAULT 0 COMMENT '候选记录数（查询时）',
+    result_count INT DEFAULT 0 COMMENT '最终返回记录数',
+    duration_ms INT DEFAULT 0 COMMENT '耗时（毫秒）',
+    status TINYINT DEFAULT 1 COMMENT '1-成功 0-失败',
+    error_msg VARCHAR(255) DEFAULT NULL COMMENT '错误信息（失败时）',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_request (request_id),
+    INDEX idx_operation (operation),
+    INDEX idx_created (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='审计日志表';
+
+-- 7. 解密错误日志表
+CREATE TABLE IF NOT EXISTS decrypt_error_log (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    request_id VARCHAR(64) NOT NULL COMMENT '关联的请求ID',
+    record_id BIGINT NOT NULL COMMENT '数据主键ID',
+    error_type VARCHAR(32) NOT NULL COMMENT '错误类型: TAG_MISMATCH/DECRYPT_FAILED/KEY_NOT_FOUND等',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_request (request_id),
+    INDEX idx_record (record_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='批量解密失败记录表';
