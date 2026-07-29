@@ -1,12 +1,15 @@
 // query_service.h
 // 查询服务层：支持精确查询和模糊查询，集成批量解密流水线
-// 集成安全审计模块
+// 集成安全审计模块 + 查询限制防护
 
 #pragma once
 
 #include <vector>
 #include <string>
 #include <cstdint>
+#include <deque>
+#include <mutex>
+#include <chrono>
 #include "database/dao.h"
 #include "crypto/key_manager.h"
 
@@ -87,6 +90,22 @@ private:
         database::FieldType fieldType,
         const std::string* expectedPlain = nullptr
     );
+
+    // ============================================================
+    // ★ 查询限制防护
+    // ============================================================
+    static constexpr size_t MIN_KEYWORD_LENGTH = 2;          // 最小查询关键词长度
+    static constexpr size_t MAX_CANDIDATE_COUNT = 10000;     // 最大候选记录数
+    static constexpr size_t MAX_REQUESTS_PER_SECOND = 10;    // 每秒最大请求数
+
+    // 频率限制相关（线程安全）
+    mutable std::mutex freqMutex_;
+    std::deque<std::chrono::steady_clock::time_point> requestTimestamps_;
+
+    // 检查方法（若违反限制则抛出 std::runtime_error）
+    void checkKeywordLength(const std::string& keyword) const;
+    void checkCandidateLimit(size_t candidateCount) const;
+    void checkFrequencyLimit();   // 非 const，因为需要修改时间戳队列
 };
 
 // ---- 辅助结构体：用于构建完整记录 ----
