@@ -1,10 +1,13 @@
 // query_service.cpp
 // 实现查询服务，集成生产者-消费者批量解密流水线
+// 集成安全审计模块
 
 #include "query/query_service.h"
 #include "decrypt/batch_decryptor.h"
 #include "crypto/sm4_cipher.h"
 #include "crypto/hmac_sm3.h"
+#include "audit/audit_logger.h"
+
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -13,9 +16,11 @@
 
 namespace query {
 
-// ---- 构造函数 ----
-QueryService::QueryService(database::DAO& dao, crypto::KeyManager& keyMgr)
-    : dao_(dao), keyMgr_(keyMgr) {}
+// ---- 构造函数（增加审计器） ----
+QueryService::QueryService(database::DAO& dao,
+                           crypto::KeyManager& keyMgr,
+                           audit::AuditLogger* auditLogger)
+    : dao_(dao), keyMgr_(keyMgr), auditLogger_(auditLogger) {}
 
 // ---- 验证 Tag ----
 bool QueryService::verifyTag(const std::string& cipher, const std::string& tag,
@@ -66,7 +71,7 @@ FullRecord QueryService::buildFullRecord(
     return rec;
 }
 
-// ---- ★ 核心方法：获取完整记录（集成生产者-消费者批量解密） ----
+// ---- ★ 核心方法：获取完整记录（集成生产者-消费者批量解密 + 审计） ----
 std::vector<FullRecord> QueryService::fetchFullRecords(
     const std::vector<int64_t>& ids,
     const std::vector<unsigned char>& encKey,
@@ -75,6 +80,9 @@ std::vector<FullRecord> QueryService::fetchFullRecords(
     const std::string* expectedPlain) {
 
     if (ids.empty()) return {};
+
+    // ★ 生成请求ID，用于关联本次查询的所有解密操作
+    std::string requestId = audit::AuditLogger::generateRequestId();
 
     // ============================================================
     // 步骤1：批量读取所有密文（IO 优化）
@@ -122,14 +130,17 @@ std::vector<FullRecord> QueryService::fetchFullRecords(
     }
 
     // ============================================================
-    // 步骤4：★ 生产者-消费者流水线批量解密
+    // 步骤4：★ 生产者-消费者流水线批量解密（传递 requestId 和 auditLogger）
     // ============================================================
     decrypt::BatchDecryptor batchDecryptor(dao_, keyMgr_);
 
     bool showProgress = (allCipherRecords.size() > 20);
 
+    // ★ 调用新的 decryptRecords 接口（带 requestId 和 auditLogger）
     auto decryptResults = batchDecryptor.decryptRecords(
         allCipherRecords,
+        requestId,                         //  传递请求ID
+        auditLogger_,                      //  传递审计器（可为空）
         [showProgress](size_t processed, size_t total) {
             if (showProgress && processed % 10 == 0) {
                 std::cout << "\r🔓 批量解密进度: " << processed << "/" << total
@@ -178,6 +189,7 @@ std::vector<FullRecord> QueryService::fetchFullRecords(
             if (it != fieldMap.end()) rec.address = it->second;
         }
 
+        // fallback：如果批量解密失败，尝试单条解密
         if (rec.name.empty() && !b.nameCipher.empty()) {
             rec.name = decryptFieldWithVersion(b.nameCipher, b.encKeyVersion, encKey);
         }
@@ -188,6 +200,7 @@ std::vector<FullRecord> QueryService::fetchFullRecords(
             rec.address = decryptFieldWithVersion(b.addrCipher, b.encKeyVersion, encKey);
         }
 
+        // 精确查询的碰撞消解
         if (expectedPlain) {
             bool match = false;
             switch (fieldType) {

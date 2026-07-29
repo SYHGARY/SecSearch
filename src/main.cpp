@@ -3,6 +3,7 @@
 // 支持密钥多版本管理、主动轮换、定时轮换、持久化到 key_config 表
 // 主密钥 KEK 从密钥文件读取，不再硬编码
 // 基于 OpenHiTLS 加密库
+// 集成安全审计模块（独立 audit 组件）
 
 #include "database/dao.h"
 #include "database/connection_pool.h"
@@ -11,6 +12,7 @@
 #include "crypto/sm4_cipher.h"
 #include "crypto/hmac_sm3.h"
 #include "crypto/utils.h"
+#include "audit/audit_logger.h"
 
 #include <hitls/crypto/crypt_eal_init.h>
 #include <hitls/crypto/crypt_errno.h>
@@ -25,6 +27,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <algorithm>
+#include <memory>
 
 #ifdef _WIN32
     #include <conio.h>
@@ -41,6 +44,9 @@ crypto::KeyManager g_keyMgr;
 std::vector<unsigned char> g_encKey;
 std::vector<unsigned char> g_idxKey;
 std::vector<unsigned char> g_tagKey;
+
+// ---- ★ 全局审计日志器 ----
+std::unique_ptr<audit::AuditLogger> g_auditLogger;
 
 // ---- 定时轮换配置 ----
 const int AUTO_ROTATE_DAYS = 90;
@@ -306,7 +312,8 @@ void keyManagement(database::DAO& dao) {
     }
 }
 
-// ---- 业务功能 ----
+// ---- ★ 业务功能（加入审计日志） ----
+
 void insertData(DAO& dao) {
     std::cout << "\n========== 插入数据 ==========" << std::endl;
     PlainData data;
@@ -314,13 +321,32 @@ void insertData(DAO& dao) {
     data.phone = getStringInput("请输入手机号: ");
     data.address = getStringInput("请输入地址: ");
 
+    std::string requestId = audit::AuditLogger::generateRequestId();
+    auto start = std::chrono::steady_clock::now();
+    bool success = true;
+    std::string errorMsg;
+    int resultCount = 0;
+    int fieldCode = 0;
+
     try {
         int encVersion = g_keyMgr.getEncryptionVersion();
         int64_t id = dao.insertData(data, g_encKey, g_idxKey, g_tagKey, encVersion);
         std::cout << "✅ 插入成功！ID = " << id << " (密钥版本: " << encVersion << ")" << std::endl;
+        resultCount = 1;
         checkAndAutoRotate(dao);
     } catch (const std::exception& e) {
+        success = false;
+        errorMsg = e.what();
         std::cout << "❌ 插入失败: " << e.what() << std::endl;
+    }
+
+    auto end = std::chrono::steady_clock::now();
+    int durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
+    if (g_auditLogger) {
+        g_auditLogger->logOperation(requestId, audit::Operation::INSERT,
+                                    fieldCode, 0, resultCount,
+                                    durationMs, success, errorMsg);
     }
 }
 
@@ -330,11 +356,31 @@ void exactQuery(QueryService& qs) {
     std::string keyword = getStringInput("请输入查询关键词: ");
     if (keyword.empty()) { std::cout << "关键词不能为空。" << std::endl; return; }
 
+    std::string requestId = audit::AuditLogger::generateRequestId();
+    auto start = std::chrono::steady_clock::now();
+    bool success = true;
+    std::string errorMsg;
+    int candidateCount = 0, resultCount = 0;
+    int fieldCode = static_cast<int>(ft);
+
     try {
         auto results = qs.exactQuery(keyword, ft, g_idxKey, g_encKey, g_tagKey);
+        candidateCount = results.size();
+        resultCount = results.size();
         printFullRecords(results);
     } catch (const std::exception& e) {
+        success = false;
+        errorMsg = e.what();
         std::cout << "❌ 查询失败: " << e.what() << std::endl;
+    }
+
+    auto end = std::chrono::steady_clock::now();
+    int durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
+    if (g_auditLogger) {
+        g_auditLogger->logOperation(requestId, audit::Operation::EXACT_QUERY,
+                                    fieldCode, candidateCount, resultCount,
+                                    durationMs, success, errorMsg);
     }
 }
 
@@ -345,11 +391,31 @@ void fuzzyQuery(QueryService& qs) {
     std::string keyword = getStringInput("请输入查询关键词: ");
     if (keyword.empty()) { std::cout << "关键词不能为空。" << std::endl; return; }
 
+    std::string requestId = audit::AuditLogger::generateRequestId();
+    auto start = std::chrono::steady_clock::now();
+    bool success = true;
+    std::string errorMsg;
+    int candidateCount = 0, resultCount = 0;
+    int fieldCode = static_cast<int>(ft);
+
     try {
         auto results = qs.fuzzyQuery(keyword, ft, g_idxKey, g_encKey, g_tagKey);
+        candidateCount = results.size();
+        resultCount = results.size();
         printFullRecords(results);
     } catch (const std::exception& e) {
+        success = false;
+        errorMsg = e.what();
         std::cout << "❌ 查询失败: " << e.what() << std::endl;
+    }
+
+    auto end = std::chrono::steady_clock::now();
+    int durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
+    if (g_auditLogger) {
+        g_auditLogger->logOperation(requestId, audit::Operation::FUZZY_QUERY,
+                                    fieldCode, candidateCount, resultCount,
+                                    durationMs, success, errorMsg);
     }
 }
 
@@ -358,22 +424,42 @@ void updateData(DAO& dao) {
     int64_t id = getIntInput("请输入要更新的记录 ID: ", 0);
     if (id <= 0) { std::cout << "无效的 ID。" << std::endl; return; }
 
-    try {
-        PlainData newData;
-        std::cout << "请输入新数据：" << std::endl;
-        newData.name = getStringInput("  新姓名: ");
-        newData.phone = getStringInput("  新手机号: ");
-        newData.address = getStringInput("  新地址: ");
+    PlainData newData;
+    std::cout << "请输入新数据：" << std::endl;
+    newData.name = getStringInput("  新姓名: ");
+    newData.phone = getStringInput("  新手机号: ");
+    newData.address = getStringInput("  新地址: ");
 
+    std::string requestId = audit::AuditLogger::generateRequestId();
+    auto start = std::chrono::steady_clock::now();
+    bool success = true;
+    std::string errorMsg;
+    int resultCount = 0;
+
+    try {
         int encVersion = g_keyMgr.getEncryptionVersion();
-        bool success = dao.updateData(id, newData, g_encKey, g_idxKey, g_tagKey, encVersion);
-        if (success) {
+        bool ok = dao.updateData(id, newData, g_encKey, g_idxKey, g_tagKey, encVersion);
+        if (ok) {
             std::cout << "✅ 更新成功！(新密钥版本: " << encVersion << ")" << std::endl;
+            resultCount = 1;
         } else {
+            success = false;
+            errorMsg = "记录不存在或更新失败";
             std::cout << "❌ 更新失败（记录可能不存在）。" << std::endl;
         }
     } catch (const std::exception& e) {
+        success = false;
+        errorMsg = e.what();
         std::cout << "❌ 更新失败: " << e.what() << std::endl;
+    }
+
+    auto end = std::chrono::steady_clock::now();
+    int durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
+    if (g_auditLogger) {
+        g_auditLogger->logOperation(requestId, audit::Operation::UPDATE,
+                                    0, 0, resultCount,
+                                    durationMs, success, errorMsg);
     }
 }
 
@@ -387,31 +473,34 @@ void deleteData(DAO& dao) {
     std::getline(std::cin, confirm);
     if (confirm != "y" && confirm != "Y") { std::cout << "已取消。" << std::endl; return; }
 
+    std::string requestId = audit::AuditLogger::generateRequestId();
+    auto start = std::chrono::steady_clock::now();
+    bool success = true;
+    std::string errorMsg;
+    int resultCount = 0;
+
     try {
-        if (dao.deleteData(id)) std::cout << "✅ 删除成功！" << std::endl;
-        else std::cout << "❌ 删除失败。" << std::endl;
+        if (dao.deleteData(id)) {
+            std::cout << "✅ 删除成功！" << std::endl;
+            resultCount = 1;
+        } else {
+            success = false;
+            errorMsg = "记录不存在或删除失败";
+            std::cout << "❌ 删除失败。" << std::endl;
+        }
     } catch (const std::exception& e) {
+        success = false;
+        errorMsg = e.what();
         std::cout << "❌ 删除失败: " << e.what() << std::endl;
     }
-}
 
-void listAllRecords(DAO& dao) {
-    std::cout << "\n========== 查看所有记录 ==========" << std::endl;
-    std::cout << "（显示姓名含'张'或手机号含'138'的记录）" << std::endl;
+    auto end = std::chrono::steady_clock::now();
+    int durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 
-    QueryService qs(dao, g_keyMgr);
-    try {
-        auto results = qs.fuzzyQuery("张", FieldType::NAME, g_idxKey, g_encKey, g_tagKey);
-        if (results.empty()) {
-            results = qs.fuzzyQuery("138", FieldType::PHONE, g_idxKey, g_encKey, g_tagKey);
-        }
-        if (results.empty()) {
-            std::cout << "数据库中没有记录。" << std::endl;
-        } else {
-            printFullRecords(results);
-        }
-    } catch (const std::exception& e) {
-        std::cout << "❌ 查询失败: " << e.what() << std::endl;
+    if (g_auditLogger) {
+        g_auditLogger->logOperation(requestId, audit::Operation::DELETE,
+                                    0, 0, resultCount,
+                                    durationMs, success, errorMsg);
     }
 }
 
@@ -424,8 +513,7 @@ void showMenu() {
     std::cout << "║  3. 模糊查询（中缀匹配）                                   ║" << std::endl;
     std::cout << "║  4. 更新数据                                              ║" << std::endl;
     std::cout << "║  5. 删除数据                                              ║" << std::endl;
-    std::cout << "║  6. 查看所有记录                                          ║" << std::endl;
-    std::cout << "║  7. 🔑 密钥管理                                           ║" << std::endl;
+    std::cout << "║  6. 密钥管理                                              ║" << std::endl;
     std::cout << "║  0. 退出                                                  ║" << std::endl;
     std::cout << "╚═══════════════════════════════════════════════════════════╝" << std::endl;
 }
@@ -541,12 +629,19 @@ int main() {
         std::cout << "✅ 密钥加载成功！当前加密密钥版本: " << g_keyMgr.getEncryptionVersion() << std::endl;
 
         // ============================================================
-        // 7. 初始化 QueryService
+        // 7. ★ 初始化全局审计日志器（独立模块，使用连接池）
         // ============================================================
-        QueryService qs(dao, g_keyMgr);
+        std::cout << "\n📋 正在初始化审计模块..." << std::endl;
+        g_auditLogger = std::make_unique<audit::AuditLogger>(&getGlobalConnectionPool());
+        std::cout << "✅ 审计模块初始化成功！" << std::endl;
 
         // ============================================================
-        // 8. 定时轮换检查
+        // 8. 初始化 QueryService（传入审计器）
+        // ============================================================
+        QueryService qs(dao, g_keyMgr, g_auditLogger.get());
+
+        // ============================================================
+        // 9. 定时轮换检查
         // ============================================================
         g_keyMgr.loadRotateTimeFromFile(ROTATE_TIME_FILE);
         checkAndAutoRotate(dao);
@@ -554,7 +649,7 @@ int main() {
         std::cout << "\n🎉 系统初始化完成！" << std::endl;
 
         // ============================================================
-        // 9. 主循环
+        // 10. 主循环
         // ============================================================
         int choice = -1;
         while (choice != 0) {
@@ -567,15 +662,14 @@ int main() {
                 case 3: fuzzyQuery(qs); break;
                 case 4: updateData(dao); break;
                 case 5: deleteData(dao); break;
-                case 6: listAllRecords(dao); break;
-                case 7: keyManagement(dao); break;
+                case 6: keyManagement(dao); break;
                 case 0: std::cout << "👋 再见！" << std::endl; break;
-                default: std::cout << "❌ 无效选项，请输入 0-7。" << std::endl;
+                default: std::cout << "❌ 无效选项，请输入 0-6。" << std::endl;
             }
         }
 
         // ============================================================
-        // 10. 清理
+        // 11. 清理
         // ============================================================
         getGlobalConnectionPool().closeAll();
         std::cout << "🔐 正在清理加密引擎..." << std::endl;
