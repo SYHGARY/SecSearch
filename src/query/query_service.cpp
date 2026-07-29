@@ -1,6 +1,6 @@
 // query_service.cpp
 // 实现查询服务，集成生产者-消费者批量解密流水线
-// 集成安全审计模块
+// 集成安全审计模块 + 查询限制防护
 
 #include "query/query_service.h"
 #include "decrypt/batch_decryptor.h"
@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <algorithm>
 #include <iostream>
+#include <deque>
 
 namespace query {
 
@@ -223,6 +224,40 @@ std::vector<FullRecord> QueryService::fetchFullRecords(
     return results;
 }
 
+// ---- ★ 查询限制检查方法 ----
+
+// 1. 检查关键词长度
+void QueryService::checkKeywordLength(const std::string& keyword) const {
+    if (keyword.length() < MIN_KEYWORD_LENGTH) {
+        throw std::runtime_error("查询关键词长度不能小于 " + std::to_string(MIN_KEYWORD_LENGTH) + " 个字符");
+    }
+}
+
+// 2. 检查候选数量
+void QueryService::checkCandidateLimit(size_t candidateCount) const {
+    if (candidateCount > MAX_CANDIDATE_COUNT) {
+        throw std::runtime_error("查询候选记录数过多（" + std::to_string(candidateCount) +
+                                 "），超过限制 " + std::to_string(MAX_CANDIDATE_COUNT) +
+                                 "。请使用更精确的关键词。");
+    }
+}
+
+// 3. 频率限制（滑动窗口）
+void QueryService::checkFrequencyLimit() {
+    std::lock_guard<std::mutex> lock(freqMutex_);
+    auto now = std::chrono::steady_clock::now();
+    // 移除 1 秒前的记录
+    auto cutoff = now - std::chrono::seconds(1);
+    while (!requestTimestamps_.empty() && requestTimestamps_.front() < cutoff) {
+        requestTimestamps_.pop_front();
+    }
+    if (requestTimestamps_.size() >= MAX_REQUESTS_PER_SECOND) {
+        throw std::runtime_error("查询频率过高，请稍后再试（每秒最多 " +
+                                 std::to_string(MAX_REQUESTS_PER_SECOND) + " 次）");
+    }
+    requestTimestamps_.push_back(now);
+}
+
 // ---- 精确查询（多版本盲索引匹配） ----
 std::vector<FullRecord> QueryService::exactQuery(
     const std::string& keyword,
@@ -230,6 +265,10 @@ std::vector<FullRecord> QueryService::exactQuery(
     const std::vector<unsigned char>& idxKey,
     const std::vector<unsigned char>& encKey,
     const std::vector<unsigned char>& tagKey) {
+
+    // ★ 查询限制检查
+    checkFrequencyLimit();                // 频率限制
+    checkKeywordLength(keyword);          // 关键词长度
 
     auto keywordBytes = std::vector<unsigned char>(keyword.begin(), keyword.end());
 
@@ -244,6 +283,10 @@ std::vector<FullRecord> QueryService::exactQuery(
     blindHashes.erase(std::unique(blindHashes.begin(), blindHashes.end()), blindHashes.end());
 
     std::vector<int64_t> ids = dao_.queryByExactIndexMulti(blindHashes, fieldType);
+
+    // ★ 候选数量限制
+    checkCandidateLimit(ids.size());
+
     if (ids.empty()) return {};
 
     return fetchFullRecords(ids, encKey, tagKey, fieldType, &keyword);
@@ -256,6 +299,10 @@ std::vector<FullRecord> QueryService::fuzzyQuery(
     const std::vector<unsigned char>& idxKey,
     const std::vector<unsigned char>& encKey,
     const std::vector<unsigned char>& tagKey) {
+
+    // ★ 查询限制检查
+    checkFrequencyLimit();                // 频率限制
+    checkKeywordLength(keyword);          // 关键词长度
 
     auto tokens = database::DAO::splitBigram(keyword);
     if (tokens.empty()) return {};
@@ -285,6 +332,9 @@ std::vector<FullRecord> QueryService::fuzzyQuery(
     if (idSet.empty()) return {};
 
     std::vector<int64_t> ids(idSet.begin(), idSet.end());
+
+    // ★ 候选数量限制（去重后的数量）
+    checkCandidateLimit(ids.size());
 
     auto results = fetchFullRecords(ids, encKey, tagKey, fieldType, nullptr);
 
