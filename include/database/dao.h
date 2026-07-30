@@ -6,6 +6,7 @@
 #include <vector>
 #include <string>
 #include <cstdint>
+#include <optional>
 #include <mysql/mysql.h>
 #include "connection_pool.h"
 #include "crypto/key_manager.h"
@@ -47,12 +48,6 @@ public:
     std::vector<int64_t> queryByExactIndexMulti(const std::vector<std::string>& blindHashes,
                                                 FieldType fieldType);
 
-    // ---- 单版本精确查询（兼容旧接口） ----
-    std::vector<int64_t> queryByExactIndex(const std::string& blindHash,
-                                           FieldType fieldType) {
-        return queryByExactIndexMulti({blindHash}, fieldType);
-    }
-
     // ---- 多版本模糊查询 ----
     std::vector<int64_t> queryByFuzzyKeywordMulti(const std::vector<std::string>& tokenHashes,
                                                   FieldType fieldType);
@@ -76,15 +71,42 @@ public:
     bool deleteData(int64_t id);
 
     // ---- ★ 密钥配置表操作（持久化密钥） ----
-    // 加载指定类型的所有密钥记录（密文形式）
     std::vector<crypto::KeyInfo> loadAllKeysFromConfig(int keyType) const;
-    // 保存密钥到配置表
     void saveKeyToConfig(int keyType, const std::vector<unsigned char>& key,
                          int version, crypto::KeyStatus status);
-    // 更新密钥状态
     void updateKeyStatusInConfig(int keyType, int version, crypto::KeyStatus status);
-    // 删除密钥
     void deleteKeyFromConfig(int keyType, int version);
+
+    // ---- ★ 索引重建任务管理 ----
+    struct RebuildTaskInfo {
+        int64_t taskId;
+        int fieldCode;
+        int64_t startId;
+        int64_t endId;
+        int64_t lastProcessedId;
+        int status;
+        int successCount = 0;
+        int failCount = 0;
+    };
+
+    int64_t createRebuildTask(int fieldCode, int64_t startId, int64_t endId);
+    std::optional<RebuildTaskInfo> getPendingRebuildTask();
+    void updateRebuildTaskProgress(int64_t taskId, int64_t lastProcessedId,
+                                   int successCount, int failCount, int status);
+    RebuildTaskInfo getRebuildTaskStatus(int64_t taskId);
+
+    // ---- ★ 按 ID 范围获取记录（用于重建） ----
+    struct RebuildRawRecord {
+        int64_t id;
+        int encKeyVersion;
+        std::string nameCipher;
+        std::string nameTag;
+        std::string phoneCipher;
+        std::string phoneTag;
+        std::string addressCipher;
+        std::string addressTag;
+    };
+    std::vector<RebuildRawRecord> getRecordsForRebuild(int64_t startId, int64_t endId, int limit);
 
     // ---- 工具方法 ----
     static std::vector<std::string> splitBigram(const std::string& text);
