@@ -16,11 +16,9 @@
 
 namespace decrypt {
 
-// ---- 构造函数 ----
 BatchDecryptor::BatchDecryptor(database::DAO& dao, crypto::KeyManager& keyMgr)
     : dao_(dao), keyMgr_(keyMgr) {}
 
-// ---- 解密单个记录 ----
 bool BatchDecryptor::decryptOneRecord(const database::CipherRecord& record,
                                       std::string& plaintext,
                                       std::string& errorMsg,
@@ -28,14 +26,12 @@ bool BatchDecryptor::decryptOneRecord(const database::CipherRecord& record,
     try {
         keyVersion = record.encKeyVersion;
 
-        // 1. 获取对应版本的 Tag 密钥
         std::vector<unsigned char> tagKey;
         if (!keyMgr_.getTagKeyByVersion(record.encKeyVersion, tagKey)) {
             errorMsg = "Tag key version " + std::to_string(record.encKeyVersion) + " not found";
             return false;
         }
 
-        // 2. 验证 Tag
         auto cipherBytes = std::vector<unsigned char>(record.cipher.begin(), record.cipher.end());
         std::string computedTag = crypto::HmacSm3::hmacHex(cipherBytes, tagKey);
         if (computedTag != record.tag) {
@@ -43,14 +39,12 @@ bool BatchDecryptor::decryptOneRecord(const database::CipherRecord& record,
             return false;
         }
 
-        // 3. 获取对应版本的加密密钥
         std::vector<unsigned char> encKey;
         if (!keyMgr_.getEncryptionKeyByVersion(record.encKeyVersion, encKey)) {
             errorMsg = "Encryption key version " + std::to_string(record.encKeyVersion) + " not found";
             return false;
         }
 
-        // 4. 解密
         auto plainBytes = crypto::Sm4Cipher::decrypt(record.cipher, encKey);
         plaintext = std::string(plainBytes.begin(), plainBytes.end());
         return true;
@@ -61,7 +55,6 @@ bool BatchDecryptor::decryptOneRecord(const database::CipherRecord& record,
     }
 }
 
-// ---- 生产者：将记录推入队列 ----
 void BatchDecryptor::producer(const std::vector<database::CipherRecord>& records,
                               std::queue<Task>& taskQueue,
                               std::mutex& queueMutex,
@@ -78,7 +71,6 @@ void BatchDecryptor::producer(const std::vector<database::CipherRecord>& records
         queueCV.notify_one();
     }
 
-    // 标记生产者完成
     {
         std::lock_guard<std::mutex> lock(queueMutex);
         done = true;
@@ -86,15 +78,13 @@ void BatchDecryptor::producer(const std::vector<database::CipherRecord>& records
     queueCV.notify_all();
 }
 
-// ---- 消费者：解密密文（带审计日志） ----
 void BatchDecryptor::consumer(std::queue<Task>& taskQueue,
                               std::mutex& queueMutex,
                               std::condition_variable& queueCV,
                               bool& done,
                               std::queue<ResultItem>& resultQueue,
                               std::mutex& resultMutex,
-                              std::condition_variable& resultCV,
-                              bool& resultDone) {
+                              std::condition_variable& resultCV) {
     while (true) {
         Task task;
         bool hasTask = false;
@@ -126,7 +116,6 @@ void BatchDecryptor::consumer(std::queue<Task>& taskQueue,
             item.result.errorMsg = success ? "" : errorMsg;
             item.result.keyVersion = keyVersion;
 
-            // ★ 如果解密失败且有审计器，记录错误日志
             if (!success && auditLogger_) {
                 std::string errorType = audit::DecryptErrorType::DECRYPT_FAILED;
                 if (errorMsg.find("Tag mismatch") != std::string::npos)
@@ -147,7 +136,6 @@ void BatchDecryptor::consumer(std::queue<Task>& taskQueue,
     }
 }
 
-// ---- ★ 核心方法：解密 CipherRecord 列表（生产者-消费者） ----
 std::vector<DecryptResult> BatchDecryptor::decryptRecords(
     const std::vector<database::CipherRecord>& records,
     const std::string& requestId,
@@ -156,7 +144,6 @@ std::vector<DecryptResult> BatchDecryptor::decryptRecords(
 
     auto startTime = std::chrono::steady_clock::now();
 
-    // ★ 保存当前请求的审计器，供消费者线程使用
     auditLogger_ = auditLogger;
     currentRequestId_ = requestId;
 
@@ -168,10 +155,8 @@ std::vector<DecryptResult> BatchDecryptor::decryptRecords(
         return {};
     }
 
-    // ★ 预分配结果向量（保证顺序）
     std::vector<DecryptResult> results(total);
 
-    // 如果数据量很小，直接串行解密（避免线程开销）
     if (total <= 4) {
         for (size_t i = 0; i < total; ++i) {
             results[i].id = records[i].id;
@@ -183,7 +168,6 @@ std::vector<DecryptResult> BatchDecryptor::decryptRecords(
             results[i].errorMsg = success ? "" : errorMsg;
             results[i].keyVersion = keyVersion;
 
-            // ★ 记录失败
             if (!success && auditLogger_) {
                 std::string errorType = audit::DecryptErrorType::DECRYPT_FAILED;
                 if (errorMsg.find("Tag mismatch") != std::string::npos)
@@ -215,7 +199,6 @@ std::vector<DecryptResult> BatchDecryptor::decryptRecords(
         return results;
     }
 
-    // ---- ★ 流水线数据结构 ----
     std::queue<Task> taskQueue;
     std::mutex queueMutex;
     std::condition_variable queueCV;
@@ -224,27 +207,22 @@ std::vector<DecryptResult> BatchDecryptor::decryptRecords(
     std::queue<ResultItem> resultQueue;
     std::mutex resultMutex;
     std::condition_variable resultCV;
-    bool resultDone = false;
 
-    // 消费者线程数（可根据 CPU 核心数调整）
     const int NUM_CONSUMERS = 3;
 
-    // ---- 启动生产者线程 ----
     std::thread producerThread([this, &records, &taskQueue, &queueMutex, &queueCV, &done]() {
         producer(records, taskQueue, queueMutex, queueCV, done);
     });
 
-    // ---- 启动消费者线程 ----
     std::vector<std::thread> consumerThreads;
     for (int i = 0; i < NUM_CONSUMERS; ++i) {
         consumerThreads.emplace_back([this, &taskQueue, &queueMutex, &queueCV, &done,
-                                       &resultQueue, &resultMutex, &resultCV, &resultDone]() {
+                                       &resultQueue, &resultMutex, &resultCV]() {
             consumer(taskQueue, queueMutex, queueCV, done,
-                     resultQueue, resultMutex, resultCV, resultDone);
+                     resultQueue, resultMutex, resultCV);
         });
     }
 
-    // ---- 主线程：收集结果 ----
     size_t processed = 0;
 
     while (processed < total) {
@@ -263,13 +241,11 @@ std::vector<DecryptResult> BatchDecryptor::decryptRecords(
         }
     }
 
-    // ---- 等待所有线程结束 ----
     producerThread.join();
     for (auto& t : consumerThreads) {
         t.join();
     }
 
-    // ---- 统计 ----
     size_t successCount = 0, failCount = 0;
     for (const auto& r : results) {
         if (r.success) successCount++;
@@ -290,7 +266,6 @@ std::vector<DecryptResult> BatchDecryptor::decryptRecords(
     return results;
 }
 
-// ---- 批量解密（从数据库读取） ----
 std::vector<DecryptResult> BatchDecryptor::decryptBatch(
     const std::vector<int64_t>& ids,
     const std::string& requestId,
@@ -302,10 +277,7 @@ std::vector<DecryptResult> BatchDecryptor::decryptBatch(
         return {};
     }
 
-    // ★ 批量读取密文
     auto records = dao_.batchSelectCiphers(ids);
-
-    // ★ 调用核心方法
     return decryptRecords(records, requestId, auditLogger, progressCb);
 }
 

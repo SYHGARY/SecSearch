@@ -4,6 +4,7 @@
 // 主密钥 KEK 从密钥文件读取，不再硬编码
 // 基于 OpenHiTLS 加密库
 // 集成安全审计模块（独立 audit 组件）
+// 集成索引重建模块
 
 #include "database/dao.h"
 #include "database/connection_pool.h"
@@ -13,6 +14,7 @@
 #include "crypto/hmac_sm3.h"
 #include "crypto/utils.h"
 #include "audit/audit_logger.h"
+#include "audit/index_rebuilder.h"
 
 #include <hitls/crypto/crypt_eal_init.h>
 #include <hitls/crypto/crypt_errno.h>
@@ -62,11 +64,6 @@ const std::vector<std::string> KEK_SEARCH_PATHS = {
 };
 
 // ---- 辅助函数 ----
-
-void clearInput() {
-    std::cin.clear();
-    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-}
 
 std::string getStringInput(const std::string& prompt) {
     std::string value;
@@ -312,6 +309,52 @@ void keyManagement(database::DAO& dao) {
     }
 }
 
+// ---- ★ 索引重建 ----
+void rebuildIndex(DAO& dao) {
+    std::cout << "\n========== 🔧 索引重建 ==========" << std::endl;
+    std::cout << "请选择要重建的字段类型：" << std::endl;
+    std::cout << "  1. 姓名" << std::endl;
+    std::cout << "  2. 手机号" << std::endl;
+    std::cout << "  3. 地址" << std::endl;
+    int fieldCode = getIntInput("请输入数字 (1-3): ", 1);
+
+    int64_t startId = getIntInput("请输入起始 ID (包含): ", 1);
+    int64_t endId = getIntInput("请输入结束 ID (包含): ", 0);
+    if (endId <= 0 || endId < startId) {
+        std::cout << "❌ 无效的 ID 范围" << std::endl;
+        return;
+    }
+
+    int batchSize = getIntInput("每批处理记录数 (默认 100): ", 100);
+    if (batchSize <= 0) batchSize = 100;
+
+    std::cout << "⏳ 开始重建索引... (请耐心等待)" << std::endl;
+
+    try {
+        rebuild::IndexRebuilder rebuilder(dao, g_keyMgr);
+
+        auto progressCb = [](const rebuild::ProgressInfo& p) {
+            // 每 100 条打印一次进度
+            if (p.processed % 100 == 0 || p.processed == p.total) {
+                std::cout << "\r   进度: " << p.processed << "/" << p.total
+                          << " (成功: " << p.successCount << ", 失败: " << p.failCount << ")"
+                          << std::flush;
+            }
+        };
+
+        int64_t result = rebuilder.rebuildField(fieldCode, startId, endId, batchSize, progressCb);
+        std::cout << std::endl;
+
+        if (result >= 0) {
+            std::cout << "✅ 索引重建完成！成功: " << result << " 条" << std::endl;
+        } else {
+            std::cout << "❌ 索引重建失败" << std::endl;
+        }
+    } catch (const std::exception& e) {
+        std::cout << "❌ 重建失败: " << e.what() << std::endl;
+    }
+}
+
 // ---- ★ 业务功能（加入审计日志） ----
 
 void insertData(DAO& dao) {
@@ -514,6 +557,7 @@ void showMenu() {
     std::cout << "║  4. 更新数据                                              ║" << std::endl;
     std::cout << "║  5. 删除数据                                              ║" << std::endl;
     std::cout << "║  6. 密钥管理                                              ║" << std::endl;
+    std::cout << "║  7. 索引重建                                              ║" << std::endl;
     std::cout << "║  0. 退出                                                  ║" << std::endl;
     std::cout << "╚═══════════════════════════════════════════════════════════╝" << std::endl;
 }
@@ -580,7 +624,6 @@ int main() {
 
         std::cout << "📍 密钥文件位置: " << kekFilePath << std::endl;
 
-        // ---- ★ 从文件读取 KEK ----
         std::vector<unsigned char> kek;
         try {
             kek = crypto::readKeyFromFile(kekFilePath);
@@ -597,7 +640,6 @@ int main() {
 
         g_keyMgr.init(kek);
 
-        // ---- ★ 从 key_config 表加载所有历史密钥 ----
         try {
             g_keyMgr.loadFromDatabase(dao, kek);
             std::cout << "✅ 从 key_config 加载成功！" << std::endl;
@@ -609,7 +651,6 @@ int main() {
             std::cerr << "❌ 从 key_config 加载失败: " << e.what() << std::endl;
             std::cerr << "   正在初始化初始密钥..." << std::endl;
 
-            // 初始化三组密钥（第一次运行时）
             std::vector<unsigned char> initEnc(16, 0xA0);
             std::vector<unsigned char> initIdx(16, 0xB0);
             std::vector<unsigned char> initTag(16, 0xC0);
@@ -629,14 +670,14 @@ int main() {
         std::cout << "✅ 密钥加载成功！当前加密密钥版本: " << g_keyMgr.getEncryptionVersion() << std::endl;
 
         // ============================================================
-        // 7. ★ 初始化全局审计日志器（独立模块，使用连接池）
+        // 7. ★ 初始化全局审计日志器
         // ============================================================
         std::cout << "\n📋 正在初始化审计模块..." << std::endl;
         g_auditLogger = std::make_unique<audit::AuditLogger>(&getGlobalConnectionPool());
         std::cout << "✅ 审计模块初始化成功！" << std::endl;
 
         // ============================================================
-        // 8. 初始化 QueryService（传入审计器）
+        // 8. 初始化 QueryService
         // ============================================================
         QueryService qs(dao, g_keyMgr, g_auditLogger.get());
 
@@ -663,8 +704,9 @@ int main() {
                 case 4: updateData(dao); break;
                 case 5: deleteData(dao); break;
                 case 6: keyManagement(dao); break;
+                case 7: rebuildIndex(dao); break;       // ★ 索引重建
                 case 0: std::cout << "👋 再见！" << std::endl; break;
-                default: std::cout << "❌ 无效选项，请输入 0-6。" << std::endl;
+                default: std::cout << "❌ 无效选项，请输入 0-7。" << std::endl;
             }
         }
 

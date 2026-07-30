@@ -8,6 +8,7 @@
 #include <sstream>
 #include <set>
 #include <cstring>
+#include <optional>
 
 namespace database {
 
@@ -380,7 +381,7 @@ std::vector<CipherRecord> DAO::batchSelectCiphers(const std::vector<int64_t>& id
     std::string sql = R"(
         SELECT id, enc_key_version, name_cipher, name_tag, phone_cipher, phone_tag,
                address_cipher, address_tag
-        FROM sensitive_data WHERE id IN (?
+        FROM sensitive_data WHERE id IN (? 
     )";
     for (size_t i = 1; i < ids.size(); ++i) sql += ",?";
     sql += ")";
@@ -587,8 +588,6 @@ bool DAO::deleteData(int64_t id) {
 
     tx.commit();
     return true;
-
-    
 }
 
 // ---- ★ 从 key_config 表加载所有密钥（密文形式） ----
@@ -648,7 +647,6 @@ std::vector<crypto::KeyInfo> DAO::loadAllKeysFromConfig(int keyType) const {
         crypto::KeyInfo info;
         info.version = version;
         info.status = static_cast<crypto::KeyStatus>(status);
-        // 存储密文（调用者用 KEK 解密）
         info.key = std::vector<unsigned char>(keyCipher, keyCipher + keyCipherLen);
         keys.push_back(info);
     }
@@ -674,8 +672,6 @@ void DAO::saveKeyToConfig(int keyType, const std::vector<unsigned char>& key,
         throw std::runtime_error("Prepare save key failed");
     }
 
-    // ★ 密钥已由调用者加密，直接存储 Base64 或十六进制
-    // 这里 key 已经是密文字节，转为字符串存储
     std::string keyStr(key.begin(), key.end());
     uint8_t statusByte = static_cast<uint8_t>(status);
 
@@ -775,6 +771,283 @@ void DAO::deleteKeyFromConfig(int keyType, int version) {
         throw std::runtime_error("Execute delete key failed");
     }
     mysql_stmt_close(stmt);
+}
+
+// ---- ★ 索引重建任务管理 ----
+
+int64_t DAO::createRebuildTask(int fieldCode, int64_t startId, int64_t endId) {
+    MYSQL* conn = connGuard_->get();
+    const char* sql = R"(
+        INSERT INTO index_rebuild_task (field_code, start_id, end_id, status)
+        VALUES (?, ?, ?, 0)
+    )";
+    MYSQL_STMT* stmt = mysql_stmt_init(conn);
+    if (!stmt || mysql_stmt_prepare(stmt, sql, strlen(sql)) != 0) {
+        if (stmt) mysql_stmt_close(stmt);
+        throw std::runtime_error("Prepare create rebuild task failed");
+    }
+
+    MYSQL_BIND bind[3];
+    memset(bind, 0, sizeof(bind));
+    bind[0].buffer_type = MYSQL_TYPE_TINY;
+    bind[0].buffer = (char*)&fieldCode;
+    bind[0].is_null = 0;
+    bind[1].buffer_type = MYSQL_TYPE_LONGLONG;
+    bind[1].buffer = (char*)&startId;
+    bind[1].is_null = 0;
+    bind[2].buffer_type = MYSQL_TYPE_LONGLONG;
+    bind[2].buffer = (char*)&endId;
+    bind[2].is_null = 0;
+
+    if (mysql_stmt_bind_param(stmt, bind) != 0 ||
+        mysql_stmt_execute(stmt) != 0) {
+        mysql_stmt_close(stmt);
+        throw std::runtime_error(mysql_stmt_error(stmt));
+    }
+
+    int64_t taskId = mysql_stmt_insert_id(stmt);
+    mysql_stmt_close(stmt);
+    return taskId;
+}
+
+std::optional<DAO::RebuildTaskInfo> DAO::getPendingRebuildTask() {
+    MYSQL* conn = connGuard_->get();
+    const char* sql = R"(
+        SELECT id, field_code, start_id, end_id, last_processed_id, status
+        FROM index_rebuild_task
+        WHERE status IN (0, 1)
+        ORDER BY created_at ASC
+        LIMIT 1
+    )";
+    MYSQL_STMT* stmt = mysql_stmt_init(conn);
+    if (!stmt || mysql_stmt_prepare(stmt, sql, strlen(sql)) != 0) {
+        if (stmt) mysql_stmt_close(stmt);
+        return std::nullopt;
+    }
+
+    if (mysql_stmt_execute(stmt) != 0) {
+        mysql_stmt_close(stmt);
+        return std::nullopt;
+    }
+
+    MYSQL_BIND out_bind[6];
+    memset(out_bind, 0, sizeof(out_bind));
+    RebuildTaskInfo info;
+    out_bind[0].buffer_type = MYSQL_TYPE_LONGLONG;
+    out_bind[0].buffer = &info.taskId;
+    out_bind[1].buffer_type = MYSQL_TYPE_TINY;
+    out_bind[1].buffer = &info.fieldCode;
+    out_bind[2].buffer_type = MYSQL_TYPE_LONGLONG;
+    out_bind[2].buffer = &info.startId;
+    out_bind[3].buffer_type = MYSQL_TYPE_LONGLONG;
+    out_bind[3].buffer = &info.endId;
+    out_bind[4].buffer_type = MYSQL_TYPE_LONGLONG;
+    out_bind[4].buffer = &info.lastProcessedId;
+    out_bind[5].buffer_type = MYSQL_TYPE_TINY;
+    out_bind[5].buffer = &info.status;
+
+    if (mysql_stmt_bind_result(stmt, out_bind) != 0) {
+        mysql_stmt_close(stmt);
+        return std::nullopt;
+    }
+
+    if (mysql_stmt_fetch(stmt) == 0) {
+        mysql_stmt_close(stmt);
+        return info;
+    }
+    mysql_stmt_close(stmt);
+    return std::nullopt;
+}
+
+void DAO::updateRebuildTaskProgress(int64_t taskId, int64_t lastProcessedId,
+                                    int successCount, int failCount, int status) {
+    MYSQL* conn = connGuard_->get();
+    const char* sql = R"(
+        UPDATE index_rebuild_task SET
+            last_processed_id = ?,
+            success_count = ?,
+            fail_count = ?,
+            status = ?
+        WHERE id = ?
+    )";
+    MYSQL_STMT* stmt = mysql_stmt_init(conn);
+    if (!stmt || mysql_stmt_prepare(stmt, sql, strlen(sql)) != 0) {
+        if (stmt) mysql_stmt_close(stmt);
+        throw std::runtime_error("Prepare update rebuild task failed");
+    }
+
+    MYSQL_BIND bind[5];
+    memset(bind, 0, sizeof(bind));
+    bind[0].buffer_type = MYSQL_TYPE_LONGLONG;
+    bind[0].buffer = (char*)&lastProcessedId;
+    bind[0].is_null = 0;
+    bind[1].buffer_type = MYSQL_TYPE_LONG;
+    bind[1].buffer = (char*)&successCount;
+    bind[1].is_null = 0;
+    bind[2].buffer_type = MYSQL_TYPE_LONG;
+    bind[2].buffer = (char*)&failCount;
+    bind[2].is_null = 0;
+    bind[3].buffer_type = MYSQL_TYPE_TINY;
+    bind[3].buffer = (char*)&status;
+    bind[3].is_null = 0;
+    bind[4].buffer_type = MYSQL_TYPE_LONGLONG;
+    bind[4].buffer = (char*)&taskId;
+    bind[4].is_null = 0;
+
+    if (mysql_stmt_bind_param(stmt, bind) != 0 ||
+        mysql_stmt_execute(stmt) != 0) {
+        mysql_stmt_close(stmt);
+        throw std::runtime_error(mysql_stmt_error(stmt));
+    }
+    mysql_stmt_close(stmt);
+}
+
+DAO::RebuildTaskInfo DAO::getRebuildTaskStatus(int64_t taskId) {
+    MYSQL* conn = connGuard_->get();
+    const char* sql = R"(
+        SELECT id, field_code, start_id, end_id, last_processed_id, status,
+               success_count, fail_count
+        FROM index_rebuild_task WHERE id = ?
+    )";
+    MYSQL_STMT* stmt = mysql_stmt_init(conn);
+    if (!stmt || mysql_stmt_prepare(stmt, sql, strlen(sql)) != 0) {
+        if (stmt) mysql_stmt_close(stmt);
+        throw std::runtime_error("Prepare get rebuild task failed");
+    }
+
+    MYSQL_BIND in_bind[1];
+    memset(in_bind, 0, sizeof(in_bind));
+    in_bind[0].buffer_type = MYSQL_TYPE_LONGLONG;
+    in_bind[0].buffer = (char*)&taskId;
+    in_bind[0].is_null = 0;
+
+    if (mysql_stmt_bind_param(stmt, in_bind) != 0 ||
+        mysql_stmt_execute(stmt) != 0) {
+        mysql_stmt_close(stmt);
+        throw std::runtime_error(mysql_stmt_error(stmt));
+    }
+
+    MYSQL_BIND out_bind[8];
+    memset(out_bind, 0, sizeof(out_bind));
+    RebuildTaskInfo info;
+    out_bind[0].buffer_type = MYSQL_TYPE_LONGLONG;
+    out_bind[0].buffer = &info.taskId;
+    out_bind[1].buffer_type = MYSQL_TYPE_TINY;
+    out_bind[1].buffer = &info.fieldCode;
+    out_bind[2].buffer_type = MYSQL_TYPE_LONGLONG;
+    out_bind[2].buffer = &info.startId;
+    out_bind[3].buffer_type = MYSQL_TYPE_LONGLONG;
+    out_bind[3].buffer = &info.endId;
+    out_bind[4].buffer_type = MYSQL_TYPE_LONGLONG;
+    out_bind[4].buffer = &info.lastProcessedId;
+    out_bind[5].buffer_type = MYSQL_TYPE_TINY;
+    out_bind[5].buffer = &info.status;
+    out_bind[6].buffer_type = MYSQL_TYPE_LONG;
+    out_bind[6].buffer = &info.successCount;
+    out_bind[7].buffer_type = MYSQL_TYPE_LONG;
+    out_bind[7].buffer = &info.failCount;
+
+    if (mysql_stmt_bind_result(stmt, out_bind) != 0) {
+        mysql_stmt_close(stmt);
+        throw std::runtime_error(mysql_stmt_error(stmt));
+    }
+
+    if (mysql_stmt_fetch(stmt) != 0) {
+        mysql_stmt_close(stmt);
+        throw std::runtime_error("Task not found");
+    }
+    mysql_stmt_close(stmt);
+    return info;
+}
+
+// ---- ★ 按 ID 范围获取记录（用于重建） ----
+std::vector<DAO::RebuildRawRecord> DAO::getRecordsForRebuild(int64_t startId, int64_t endId, int limit) {
+    std::vector<RebuildRawRecord> records;
+    MYSQL* conn = connGuard_->get();
+
+    const char* sql = R"(
+        SELECT id, enc_key_version,
+               name_cipher, name_tag,
+               phone_cipher, phone_tag,
+               address_cipher, address_tag
+        FROM sensitive_data
+        WHERE id >= ? AND id <= ?
+        ORDER BY id ASC
+        LIMIT ?
+    )";
+
+    MYSQL_STMT* stmt = mysql_stmt_init(conn);
+    if (!stmt || mysql_stmt_prepare(stmt, sql, strlen(sql)) != 0) {
+        if (stmt) mysql_stmt_close(stmt);
+        throw std::runtime_error("Prepare get records for rebuild failed");
+    }
+
+    MYSQL_BIND in_bind[3];
+    memset(in_bind, 0, sizeof(in_bind));
+    in_bind[0].buffer_type = MYSQL_TYPE_LONGLONG;
+    in_bind[0].buffer = (char*)&startId;
+    in_bind[0].is_null = 0;
+    in_bind[1].buffer_type = MYSQL_TYPE_LONGLONG;
+    in_bind[1].buffer = (char*)&endId;
+    in_bind[1].is_null = 0;
+    in_bind[2].buffer_type = MYSQL_TYPE_LONG;
+    in_bind[2].buffer = (char*)&limit;
+    in_bind[2].is_null = 0;
+
+    if (mysql_stmt_bind_param(stmt, in_bind) != 0 ||
+        mysql_stmt_execute(stmt) != 0) {
+        mysql_stmt_close(stmt);
+        throw std::runtime_error(mysql_stmt_error(stmt));
+    }
+
+    MYSQL_BIND out_bind[8];
+    memset(out_bind, 0, sizeof(out_bind));
+    RebuildRawRecord rec;
+    char nameCipher[4096], nameTag[65], phoneCipher[4096], phoneTag[65];
+    char addrCipher[4096], addrTag[65];
+    unsigned long nameCipherLen, nameTagLen, phoneCipherLen, phoneTagLen;
+    unsigned long addrCipherLen, addrTagLen;
+    bool isNull[8];
+
+    out_bind[0].buffer_type = MYSQL_TYPE_LONGLONG;
+    out_bind[0].buffer = &rec.id;
+    out_bind[0].is_null = &isNull[0];
+
+    out_bind[1].buffer_type = MYSQL_TYPE_LONG;
+    out_bind[1].buffer = &rec.encKeyVersion;
+    out_bind[1].is_null = &isNull[1];
+
+    #define SET_STR_OUT(i, buf, len) \
+        out_bind[i].buffer_type = MYSQL_TYPE_STRING; \
+        out_bind[i].buffer = buf; \
+        out_bind[i].buffer_length = sizeof(buf); \
+        out_bind[i].length = &len; \
+        out_bind[i].is_null = &isNull[i]
+
+    SET_STR_OUT(2, nameCipher, nameCipherLen);
+    SET_STR_OUT(3, nameTag, nameTagLen);
+    SET_STR_OUT(4, phoneCipher, phoneCipherLen);
+    SET_STR_OUT(5, phoneTag, phoneTagLen);
+    SET_STR_OUT(6, addrCipher, addrCipherLen);
+    SET_STR_OUT(7, addrTag, addrTagLen);
+
+    if (mysql_stmt_bind_result(stmt, out_bind) != 0) {
+        mysql_stmt_close(stmt);
+        throw std::runtime_error(mysql_stmt_error(stmt));
+    }
+
+    while (mysql_stmt_fetch(stmt) == 0) {
+        rec.nameCipher = isNull[2] ? "" : std::string(nameCipher, nameCipherLen);
+        rec.nameTag = isNull[3] ? "" : std::string(nameTag, nameTagLen);
+        rec.phoneCipher = isNull[4] ? "" : std::string(phoneCipher, phoneCipherLen);
+        rec.phoneTag = isNull[5] ? "" : std::string(phoneTag, phoneTagLen);
+        rec.addressCipher = isNull[6] ? "" : std::string(addrCipher, addrCipherLen);
+        rec.addressTag = isNull[7] ? "" : std::string(addrTag, addrTagLen);
+        records.push_back(rec);
+    }
+
+    mysql_stmt_close(stmt);
+    return records;
 }
 
 } // namespace database
