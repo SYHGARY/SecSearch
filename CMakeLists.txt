@@ -77,6 +77,7 @@ set(COMMON_SRC
     src/query/query_service.cpp
     src/decrypt/batch_decryptor.cpp
     src/audit/audit_logger.cpp
+    src/audit/index_rebuilder
 )
 
 add_library(secsearch_common OBJECT ${COMMON_SRC})
