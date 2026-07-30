@@ -81,3 +81,20 @@ CREATE TABLE IF NOT EXISTS decrypt_error_log (
     INDEX idx_request (request_id),
     INDEX idx_record (record_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='批量解密失败记录表';
+
+-- 8. 索引重建任务表
+CREATE TABLE IF NOT EXISTS index_rebuild_task (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    field_code TINYINT NOT NULL COMMENT '字段类型: 1-姓名, 2-手机号, 3-地址',
+    start_id BIGINT NOT NULL COMMENT '起始记录ID (包含)',
+    end_id BIGINT NOT NULL COMMENT '结束记录ID (包含)',
+    status TINYINT DEFAULT 0 COMMENT '状态: 0-待执行, 1-执行中, 2-已完成, 3-失败',
+    success_count INT DEFAULT 0 COMMENT '已成功重建的记录数',
+    fail_count INT DEFAULT 0 COMMENT '失败的记录数',
+    last_processed_id BIGINT DEFAULT 0 COMMENT '最后一次成功处理的ID, 用于断点续跑',
+    error_msg VARCHAR(512) DEFAULT NULL COMMENT '错误信息(失败时记录)',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_status (status),
+    INDEX idx_field (field_code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='索引重建任务表';
