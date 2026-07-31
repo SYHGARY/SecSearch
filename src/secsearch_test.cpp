@@ -669,14 +669,19 @@ void runBatchDecryptPerfTest(DAO& dao, BatchDecryptor& decryptor, KeyManager& ke
     auto cipherRecords = dao.batchSelectCiphers(ids);
     auto nameRecords = filterByFieldType(cipherRecords, FieldType::NAME);
 
-    // 对照组：逐条串行解密
+    // 对照组：逐条串行解密（含Tag校验，与批量解密对齐）
     std::cout << "\n  对照组: 逐条串行解密..." << std::endl;
     auto start1 = std::chrono::high_resolution_clock::now();
     int serialSuccess = 0;
     for (const auto& rec : nameRecords) {
         try {
             auto plain = Sm4Cipher::decrypt(rec.cipher, encKey);
-            serialSuccess++;
+            // 校验Tag（与批量解密逻辑对齐）
+            auto cipherBytes = std::vector<unsigned char>(rec.cipher.begin(), rec.cipher.end());
+            std::string computedTag = crypto::HmacSm3::hmacHex(cipherBytes, tagKey);
+            if (computedTag == rec.tag) {
+                serialSuccess++;
+            }
         } catch (...) {}
     }
     auto end1 = std::chrono::high_resolution_clock::now();
@@ -828,6 +833,8 @@ void runConcurrencyTest(DAO& dao, KeyManager& keyMgr) {
 
     for (int t = 0; t < THREAD_COUNT; ++t) {
         threads.emplace_back([&, t]() {
+            // 每个线程创建独立的DAO对象，共享同一个连接池
+            DAO threadDao(&getGlobalConnectionPool());
             for (int i = 0; i < OPS_PER_THREAD; ++i) {
                 try {
                     PlainData data{
@@ -835,7 +842,7 @@ void runConcurrencyTest(DAO& dao, KeyManager& keyMgr) {
                         "139" + std::to_string(10000000 + t * 100 + i),
                         "并发地址" + std::to_string(i)
                     };
-                    int64_t id = dao.insertData(data, encKey, idxKey, tagKey, encVer);
+                    int64_t id = threadDao.insertData(data, encKey, idxKey, tagKey, encVer);
                     {
                         std::lock_guard<std::mutex> lock(idMutex);
                         allIds.push_back(id);
