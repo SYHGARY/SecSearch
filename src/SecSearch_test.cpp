@@ -1,5 +1,4 @@
-// secsearch_test.cpp - 综合测试套件：功能测试、性能基准、边界稳定性、安全合规
-// 修正版本：性能测试仅生成一次数据，避免重复插入/删除
+// SecSearch_test.cpp - 综合测试套件：功能测试、性能基准、边界稳定性、安全合规
 
 #include "database/dao.h"
 #include "database/connection_pool.h"
