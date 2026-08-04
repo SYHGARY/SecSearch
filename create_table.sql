@@ -98,3 +98,17 @@ CREATE TABLE IF NOT EXISTS index_rebuild_task (
     INDEX idx_status (status),
     INDEX idx_field (field_code)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='索引重建任务表';
+
+-- 9. 清空所有表数据
+USE secsearch;
+
+SET FOREIGN_KEY_CHECKS = 0;
+
+TRUNCATE TABLE sensitive_data;
+TRUNCATE TABLE fuzzy_inverted;
+TRUNCATE TABLE key_config;
+TRUNCATE TABLE audit_log;
+TRUNCATE TABLE decrypt_error_log;
+TRUNCATE TABLE index_rebuild_task;
+
+SET FOREIGN_KEY_CHECKS = 1;
