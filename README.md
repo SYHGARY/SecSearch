@@ -45,7 +45,7 @@ SecSearch/
 │   ├── query/
 │   ├── decrypt/
 │   └── audit/
-└── lib/                        # 第三方静态库 (OpenHiTLS + MySQL)
+└── lib/                        # 第三方静态库 (OpenHiTLS + MySQL + GmSSL)
 ```
 
 ## 环境要求
