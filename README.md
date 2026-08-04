@@ -146,7 +146,4 @@ KEK 搜索路径（按优先级）：
 
 ## License
 
-本项目仅供学习研究使用。OpenHiTLS 库遵循其自身开源协议。
-
-
-本项目仅供学习研究使用。OpenHiTLS 库遵循其自身开源协议。
+本项目仅供学习研究使用。OpenHiTLS / GmSSL / MySQL 库遵循其自身开源协议。
