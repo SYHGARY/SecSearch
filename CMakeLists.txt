@@ -13,47 +13,72 @@ set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -Wall -Wextra")
 set(CMAKE_CXX_FLAGS_RELEASE "-O2 -Wall -DNDEBUG")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR})
 
-# ---- 依赖查找 ----
-find_path(MYSQL_INCLUDE_DIR NAMES mysql/mysql.h PATHS /usr/include /usr/local/include)
-find_library(MYSQL_LIBRARY NAMES mysqlclient mysql PATHS /usr/lib /usr/lib/x86_64-linux-gnu /usr/local/lib)
+# ============================================================
+# 依赖库查找（优先使用项目内 lib/ 和 include/）
+# ============================================================
 
+# ---- MySQL ----
+find_path(MYSQL_INCLUDE_DIR NAMES mysql/mysql.h
+    PATHS /usr/include /usr/local/include
+)
+find_library(MYSQL_LIBRARY NAMES mysqlclient mysql
+    PATHS /usr/lib /usr/lib/x86_64-linux-gnu /usr/local/lib
+)
+
+# ---- OpenSSL ----
 find_package(OpenSSL REQUIRED)
-find_package(ZLIB REQUIRED)
-find_library(ZSTD_LIBRARY NAMES zstd PATHS /usr/lib /usr/lib/x86_64-linux-gnu)
 
-find_library(BOUNDSCHECK_LIBRARY NAMES boundscheck PATHS ${CMAKE_SOURCE_DIR}/lib)
+# ---- ZLIB ----
+find_package(ZLIB REQUIRED)
+
+# ---- ZSTD ----
+find_library(ZSTD_LIBRARY NAMES zstd
+    PATHS /usr/lib /usr/lib/x86_64-linux-gnu
+)
+
+# ---- boundscheck（可选） ----
+find_library(BOUNDSCHECK_LIBRARY NAMES boundscheck
+    PATHS ${CMAKE_SOURCE_DIR}/lib
+          /usr/local/lib /usr/lib
+)
 if(BOUNDSCHECK_LIBRARY AND BOUNDSCHECK_LIBRARY MATCHES "-NOTFOUND$")
     set(BOUNDSCHECK_LIBRARY "")
 endif()
 
-find_path(HITLS_INCLUDE_DIR NAMES hitls/crypto/crypt_eal_cipher.h PATHS ${CMAKE_SOURCE_DIR}/include /usr/local/include /usr/include)
-find_library(HITLS_CRYPTO_LIBRARY NAMES hitls_crypto PATHS ${CMAKE_SOURCE_DIR}/lib /usr/local/lib /usr/lib)
-find_library(HITLS_BSL_LIBRARY NAMES hitls_bsl PATHS ${CMAKE_SOURCE_DIR}/lib /usr/local/lib /usr/lib)
+# ---- ★ OpenHiTLS（优先项目内 lib/） ----
+find_path(HITLS_INCLUDE_DIR NAMES hitls/crypto/crypt_eal_cipher.h
+    PATHS ${CMAKE_SOURCE_DIR}/include
+          /usr/local/include /usr/include
+)
+find_library(HITLS_CRYPTO_LIBRARY NAMES hitls_crypto
+    PATHS ${CMAKE_SOURCE_DIR}/lib
+          /usr/local/lib /usr/lib
+)
+find_library(HITLS_BSL_LIBRARY NAMES hitls_bsl
+    PATHS ${CMAKE_SOURCE_DIR}/lib
+          /usr/local/lib /usr/lib
+)
 
-# ==========  GmSSL（支持项目内和系统路径） ==========
-find_path(GMSSL_INCLUDE_DIR
-    NAMES gmssl/sm4.h
-    PATHS ${CMAKE_SOURCE_DIR}/include          # 项目内 include
+# ---- ★ GmSSL（可选，用于 SecSearch_SM4test，优先项目内） ----
+find_path(GMSSL_INCLUDE_DIR NAMES gmssl/sm4.h
+    PATHS ${CMAKE_SOURCE_DIR}/include
           /usr/local/gmssl/include
-          /usr/local/include
-          /usr/include
+          /usr/local/include /usr/include
 )
-
-find_library(GMSSL_LIBRARY
-    NAMES gmssl
-    PATHS ${CMAKE_SOURCE_DIR}/lib              # 项目内 lib
+find_library(GMSSL_LIBRARY NAMES gmssl
+    PATHS ${CMAKE_SOURCE_DIR}/lib
           /usr/local/gmssl/lib
-          /usr/local/lib
-          /usr/lib
+          /usr/local/lib /usr/lib
 )
-
 if(GMSSL_INCLUDE_DIR AND GMSSL_LIBRARY)
     message(STATUS "GmSSL found: ${GMSSL_INCLUDE_DIR}")
 else()
-    message(WARNING "GmSSL not found. benchmark_sm4 will not be built.")
+    message(WARNING "GmSSL not found. SecSearch_SM4test will not be built.")
 endif()
 
-# ---- 公共源码 ----
+# ============================================================
+# 公共源码库
+# ============================================================
 set(COMMON_SRC
     src/crypto/utils.cpp
     src/crypto/sm4_cipher.cpp
@@ -74,9 +99,9 @@ target_include_directories(secsearch_common PUBLIC
     ${HITLS_INCLUDE_DIR}
 )
 
-# ---- 主程序 ----
-add_executable(SecSearch src/main.cpp)
-
+# ============================================================
+# 链接库列表
+# ============================================================
 set(LINK_LIBS
     ${HITLS_CRYPTO_LIBRARY}
     ${HITLS_BSL_LIBRARY}
@@ -92,33 +117,42 @@ if(BOUNDSCHECK_LIBRARY)
     list(APPEND LINK_LIBS ${BOUNDSCHECK_LIBRARY})
 endif()
 
+# ============================================================
+# 主程序
+# ============================================================
+add_executable(SecSearch src/main.cpp)
 target_link_libraries(SecSearch secsearch_common ${LINK_LIBS})
 
-# ---- 测试程序 ----
-add_executable(SecSearch_test src/secsearch_test.cpp)
+# ============================================================
+# 测试程序
+# ============================================================
+add_executable(SecSearch_test src/SecSearch_test.cpp)
 target_link_libraries(SecSearch_test secsearch_common ${LINK_LIBS})
 
-# ==========  性能对比测试 (OpenHiTLS vs GmSSL) ==========
+# ============================================================
+# ★ OpenHiTLS vs GmSSL 性能对比测试
+# ============================================================
 if(GMSSL_INCLUDE_DIR AND GMSSL_LIBRARY)
-    add_executable(benchmark_sm4 src/benchmark_sm4.cpp)
-    target_include_directories(benchmark_sm4 PRIVATE
+    add_executable(SecSearch_SM4test src/SecSearch_SM4test.cpp)
+    target_include_directories(SecSearch_SM4test PRIVATE
         ${GMSSL_INCLUDE_DIR}
         ${HITLS_INCLUDE_DIR}
     )
-    target_link_libraries(benchmark_sm4
+    target_link_libraries(SecSearch_SM4test
         ${HITLS_CRYPTO_LIBRARY}
         ${HITLS_BSL_LIBRARY}
         ${GMSSL_LIBRARY}
         pthread
         dl
     )
-    # 如果找到了 boundscheck，才链接（可选）
     if(BOUNDSCHECK_LIBRARY)
-        target_link_libraries(benchmark_sm4 ${BOUNDSCHECK_LIBRARY})
+        target_link_libraries(SecSearch_SM4test ${BOUNDSCHECK_LIBRARY})
     endif()
 endif()
 
-# ---- 配置检查 ----
+# ============================================================
+# 配置检查
+# ============================================================
 if(NOT BOUNDSCHECK_LIBRARY)
     message(WARNING "boundscheck library not found. If you see undefined references to __security_check_cookie or memcpy_s, please install libboundscheck.")
 endif()
