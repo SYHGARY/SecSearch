@@ -34,6 +34,7 @@ SecSearch/
 │   ├── decrypt/                # 批量解密流水线
 │   ├── audit/                  # 审计日志 & 索引重建
 │   ├── hitls/                  # OpenHiTLS 头文件
+│   ├── gmssl/                  # GmSSL 头文件
 │   └── mysql/                  # MySQL 头文件
 ├── src/
 │   ├── main.cpp                # 主程序入口 (交互式 CLI)
@@ -75,7 +76,9 @@ cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 ```
 
-可执行文件输出至项目根目录：`./SecSearch`
+主体可执行文件输出至项目根目录：`./SecSearch`  
+全量测试可执行文件输出至项目根目录：`./SecSearch_test`  
+SM4算法性能测试可执行文件输出至项目根目录：`./SecSearch_SM4test`
 
 ### 3. 初始化数据库
 
