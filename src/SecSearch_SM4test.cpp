@@ -1,4 +1,4 @@
-// benchmark_sm4.cpp
+// SecSearch_SM4test.cpp
 // OpenHiTLS vs GmSSL SM4-CBC 性能对比测试
 
 #include <iostream>
