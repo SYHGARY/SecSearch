@@ -552,8 +552,8 @@ void showMenu() {
     std::cout << "║              🔐 密文数据库查询系统                        ║" << std::endl;
     std::cout << "╠═══════════════════════════════════════════════════════════╣" << std::endl;
     std::cout << "║  1. 插入数据                                              ║" << std::endl;
-    std::cout << "║  2. 精确查询（等值匹配）                                   ║" << std::endl;
-    std::cout << "║  3. 模糊查询（中缀匹配）                                   ║" << std::endl;
+    std::cout << "║  2. 精确查询（等值匹配）                                  ║" << std::endl;
+    std::cout << "║  3. 模糊查询（中缀匹配）                                  ║" << std::endl;
     std::cout << "║  4. 更新数据                                              ║" << std::endl;
     std::cout << "║  5. 删除数据                                              ║" << std::endl;
     std::cout << "║  6. 密钥管理                                              ║" << std::endl;

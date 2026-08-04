@@ -1,284 +1,257 @@
 // batch_decryptor.cpp
-// 实现生产者-消费者流水线批量解密
-// 集成安全审计模块
+// 生产者-消费者流水线批量解密实现
 
 #include "decrypt/batch_decryptor.h"
 #include "crypto/sm4_cipher.h"
 #include "crypto/hmac_sm3.h"
 #include "audit/audit_logger.h"
 
-#include <thread>
 #include <chrono>
-#include <stdexcept>
 #include <algorithm>
-#include <unordered_map>
-#include <iostream>
+#include <thread>
+#include <cassert>
 
 namespace decrypt {
 
-BatchDecryptor::BatchDecryptor(database::DAO& dao, crypto::KeyManager& keyMgr)
-    : dao_(dao), keyMgr_(keyMgr) {}
+// ---- 构造函数 ----
+BatchDecryptor::BatchDecryptor(
+        database::DAO& dao,
+        crypto::KeyManager& keyMgr,
+        size_t workerCount,
+        size_t queueCapacity)
+    : dao_(dao),
+      keyMgr_(keyMgr),
+      queueCapacity_(queueCapacity) {
+    if (workerCount == 0) {
+        workerCount = 4;
+        // std::max<size_t>(2, std::thread::hardware_concurrency());
+    }
+    for (size_t i = 0; i < workerCount; ++i) {
+        workers_.emplace_back(&BatchDecryptor::workerLoop, this);
+    }
+}
 
-bool BatchDecryptor::decryptOneRecord(const database::CipherRecord& record,
-                                      std::string& plaintext,
-                                      std::string& errorMsg,
-                                      int& keyVersion) {
+// ---- 析构函数 ----
+BatchDecryptor::~BatchDecryptor() {
+    stop_ = true;
+    taskNotEmpty_.notify_all();
+    taskNotFull_.notify_all();
+    resultReady_.notify_all();
+    for (auto& t : workers_) {
+        if (t.joinable()) t.join();
+    }
+}
+
+// ---- 解密单条记录 ----
+bool BatchDecryptor::decryptOneRecord(
+        const database::CipherRecord& record,
+        std::string& plaintext,
+        std::string& error,
+        int& keyVersion) {
     try {
         keyVersion = record.encKeyVersion;
 
         std::vector<unsigned char> tagKey;
         if (!keyMgr_.getTagKeyByVersion(record.encKeyVersion, tagKey)) {
-            errorMsg = "Tag key version " + std::to_string(record.encKeyVersion) + " not found";
+            error = "Tag key version " + std::to_string(record.encKeyVersion) + " not found";
             return false;
         }
 
-        auto cipherBytes = std::vector<unsigned char>(record.cipher.begin(), record.cipher.end());
-        std::string computedTag = crypto::HmacSm3::hmacHex(cipherBytes, tagKey);
-        if (computedTag != record.tag) {
-            errorMsg = "Integrity check failed (Tag mismatch)";
+        std::vector<unsigned char> cipherBytes(record.cipher.begin(), record.cipher.end());
+        std::string calcTag = crypto::HmacSm3::hmacHex(cipherBytes, tagKey);
+        if (calcTag != record.tag) {
+            error = "Tag verification failed";
             return false;
         }
 
         std::vector<unsigned char> encKey;
         if (!keyMgr_.getEncryptionKeyByVersion(record.encKeyVersion, encKey)) {
-            errorMsg = "Encryption key version " + std::to_string(record.encKeyVersion) + " not found";
+            error = "Encryption key version " + std::to_string(record.encKeyVersion) + " not found";
             return false;
         }
 
-        auto plainBytes = crypto::Sm4Cipher::decrypt(record.cipher, encKey);
-        plaintext = std::string(plainBytes.begin(), plainBytes.end());
-        return true;
+        auto plain = crypto::Sm4Cipher::decrypt(record.cipher, encKey);
+        plaintext.assign(plain.begin(), plain.end());
 
+        return true;
     } catch (const std::exception& e) {
-        errorMsg = e.what();
+        error = e.what();
         return false;
     }
 }
 
-void BatchDecryptor::producer(const std::vector<database::CipherRecord>& records,
-                              std::queue<Task>& taskQueue,
-                              std::mutex& queueMutex,
-                              std::condition_variable& queueCV,
-                              bool& done) {
-    for (size_t i = 0; i < records.size(); ++i) {
-        Task task;
-        task.record = records[i];
-        task.index = i;
-        {
-            std::lock_guard<std::mutex> lock(queueMutex);
-            taskQueue.push(task);
-        }
-        queueCV.notify_one();
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(queueMutex);
-        done = true;
-    }
-    queueCV.notify_all();
+// ---- 将任务推入队列（可能阻塞直到队列有空间） ----
+void BatchDecryptor::pushTask(Task&& task) {
+    std::unique_lock<std::mutex> lock(taskMutex_);
+    taskNotFull_.wait(lock, [this]() {
+        return stop_ || taskQueue_.size() < queueCapacity_;
+    });
+    if (stop_) return;
+    taskQueue_.push(std::move(task));
+    taskNotEmpty_.notify_one();
 }
 
-void BatchDecryptor::consumer(std::queue<Task>& taskQueue,
-                              std::mutex& queueMutex,
-                              std::condition_variable& queueCV,
-                              bool& done,
-                              std::queue<ResultItem>& resultQueue,
-                              std::mutex& resultMutex,
-                              std::condition_variable& resultCV) {
+// ---- 工作线程主循环 ----
+void BatchDecryptor::workerLoop() {
     while (true) {
         Task task;
-        bool hasTask = false;
-
         {
-            std::unique_lock<std::mutex> lock(queueMutex);
-            queueCV.wait(lock, [&] { return !taskQueue.empty() || done; });
-
-            if (!taskQueue.empty()) {
-                task = taskQueue.front();
-                taskQueue.pop();
-                hasTask = true;
-            } else if (done) {
-                break;
+            std::unique_lock<std::mutex> lock(taskMutex_);
+            taskNotEmpty_.wait(lock, [this]() {
+                return stop_ || !taskQueue_.empty();
+            });
+            if (stop_ && taskQueue_.empty()) {
+                return;
             }
+            task = std::move(taskQueue_.front());
+            taskQueue_.pop();
+            taskNotFull_.notify_one();
         }
 
-        if (hasTask) {
-            ResultItem item;
-            item.index = task.index;
-            item.result.id = task.record.id;
-
-            std::string plaintext, errorMsg;
-            int keyVersion;
-            bool success = decryptOneRecord(task.record, plaintext, errorMsg, keyVersion);
-
-            item.result.success = success;
-            item.result.plaintext = success ? plaintext : "";
-            item.result.errorMsg = success ? "" : errorMsg;
-            item.result.keyVersion = keyVersion;
-
-            if (!success && auditLogger_) {
+        // ---- 执行解密 ----
+        DecryptResult result;
+        result.id = task.record.id;
+        std::string plain, error;
+        int version = 0;
+        bool ok = decryptOneRecord(task.record, plain, error, version);
+        result.success = ok;
+        result.keyVersion = version;
+        if (ok) {
+            result.plaintext = std::move(plain);
+        } else {
+            result.errorMsg = std::move(error);
+            if (logger_) {
                 std::string errorType = audit::DecryptErrorType::DECRYPT_FAILED;
-                if (errorMsg.find("Tag mismatch") != std::string::npos)
+                if (error.find("Tag") != std::string::npos)
                     errorType = audit::DecryptErrorType::TAG_MISMATCH;
-                else if (errorMsg.find("key") != std::string::npos || errorMsg.find("version") != std::string::npos)
+                else if (error.find("key") != std::string::npos || error.find("version") != std::string::npos)
                     errorType = audit::DecryptErrorType::KEY_NOT_FOUND;
-                else if (errorMsg.find("Invalid") != std::string::npos)
-                    errorType = audit::DecryptErrorType::CIPHER_CORRUPTED;
-                auditLogger_->logDecryptError(currentRequestId_, task.record.id, errorType);
+                logger_->logDecryptError(requestId_, task.record.id, errorType);
             }
-
-            {
-                std::lock_guard<std::mutex> lock(resultMutex);
-                resultQueue.push(item);
-            }
-            resultCV.notify_one();
         }
+
+        // ---- 放入结果队列 ----
+        {
+            std::lock_guard<std::mutex> lock(resultMutex_);
+            resultQueue_.push(ResultItem{task.index, std::move(result)});
+        }
+        resultReady_.notify_one();
     }
 }
 
-std::vector<DecryptResult> BatchDecryptor::decryptRecords(
-    const std::vector<database::CipherRecord>& records,
-    const std::string& requestId,
-    audit::AuditLogger* auditLogger,
-    std::function<void(size_t, size_t)> progressCb) {
-
-    auto startTime = std::chrono::steady_clock::now();
-
-    auditLogger_ = auditLogger;
-    currentRequestId_ = requestId;
-
-    const size_t total = records.size();
-    if (total == 0) {
-        lastStats_ = {0, 0, 0, 0.0};
-        auditLogger_ = nullptr;
-        currentRequestId_.clear();
-        return {};
-    }
-
-    std::vector<DecryptResult> results(total);
-
-    if (total <= 4) {
-        for (size_t i = 0; i < total; ++i) {
-            results[i].id = records[i].id;
-            std::string plaintext, errorMsg;
-            int keyVersion;
-            bool success = decryptOneRecord(records[i], plaintext, errorMsg, keyVersion);
-            results[i].success = success;
-            results[i].plaintext = success ? plaintext : "";
-            results[i].errorMsg = success ? "" : errorMsg;
-            results[i].keyVersion = keyVersion;
-
-            if (!success && auditLogger_) {
-                std::string errorType = audit::DecryptErrorType::DECRYPT_FAILED;
-                if (errorMsg.find("Tag mismatch") != std::string::npos)
-                    errorType = audit::DecryptErrorType::TAG_MISMATCH;
-                else if (errorMsg.find("key") != std::string::npos || errorMsg.find("version") != std::string::npos)
-                    errorType = audit::DecryptErrorType::KEY_NOT_FOUND;
-                else if (errorMsg.find("Invalid") != std::string::npos)
-                    errorType = audit::DecryptErrorType::CIPHER_CORRUPTED;
-                auditLogger_->logDecryptError(currentRequestId_, records[i].id, errorType);
-            }
-
-            if (progressCb) progressCb(i + 1, total);
+// ---- 收集结果（供 decryptRecords 和 decryptBatch 复用） ----
+std::vector<DecryptResult> BatchDecryptor::collectResults(
+        size_t totalTasks,
+        std::function<void(size_t, size_t)> progress) {
+    std::vector<DecryptResult> results(totalTasks);
+    size_t finished = 0;
+    while (finished < totalTasks) {
+        ResultItem item;
+        {
+            std::unique_lock<std::mutex> lock(resultMutex_);
+            resultReady_.wait(lock, [this]() {
+                return !resultQueue_.empty();
+            });
+            item = std::move(resultQueue_.front());
+            resultQueue_.pop();
         }
-
-        auto endTime = std::chrono::steady_clock::now();
-        lastStats_ = {
-            .total = total,
-            .successCount = 0,
-            .failCount = 0,
-            .elapsedMs = std::chrono::duration<double, std::milli>(endTime - startTime).count()
-        };
-        for (const auto& r : results) {
-            if (r.success) lastStats_.successCount++;
-            else lastStats_.failCount++;
-        }
-
-        auditLogger_ = nullptr;
-        currentRequestId_.clear();
-        return results;
-    }
-
-    std::queue<Task> taskQueue;
-    std::mutex queueMutex;
-    std::condition_variable queueCV;
-    bool done = false;
-
-    std::queue<ResultItem> resultQueue;
-    std::mutex resultMutex;
-    std::condition_variable resultCV;
-
-    const int NUM_CONSUMERS = 3;
-
-    std::thread producerThread([this, &records, &taskQueue, &queueMutex, &queueCV, &done]() {
-        producer(records, taskQueue, queueMutex, queueCV, done);
-    });
-
-    std::vector<std::thread> consumerThreads;
-    for (int i = 0; i < NUM_CONSUMERS; ++i) {
-        consumerThreads.emplace_back([this, &taskQueue, &queueMutex, &queueCV, &done,
-                                       &resultQueue, &resultMutex, &resultCV]() {
-            consumer(taskQueue, queueMutex, queueCV, done,
-                     resultQueue, resultMutex, resultCV);
-        });
-    }
-
-    size_t processed = 0;
-
-    while (processed < total) {
-        std::unique_lock<std::mutex> lock(resultMutex);
-        resultCV.wait(lock, [&] { return !resultQueue.empty(); });
-
-        while (!resultQueue.empty()) {
-            auto item = resultQueue.front();
-            resultQueue.pop();
-            results[item.index] = item.result;
-            processed++;
-
-            if (progressCb) {
-                progressCb(processed, total);
-            }
+        assert(item.index < results.size());
+        results[item.index] = std::move(item.result);
+        ++finished;
+        if (progress) {
+            progress(finished, totalTasks);
         }
     }
-
-    producerThread.join();
-    for (auto& t : consumerThreads) {
-        t.join();
-    }
-
-    size_t successCount = 0, failCount = 0;
-    for (const auto& r : results) {
-        if (r.success) successCount++;
-        else failCount++;
-    }
-
-    auto endTime = std::chrono::steady_clock::now();
-
-    lastStats_ = {
-        .total = total,
-        .successCount = successCount,
-        .failCount = failCount,
-        .elapsedMs = std::chrono::duration<double, std::milli>(endTime - startTime).count()
-    };
-
-    auditLogger_ = nullptr;
-    currentRequestId_.clear();
     return results;
 }
 
-std::vector<DecryptResult> BatchDecryptor::decryptBatch(
-    const std::vector<int64_t>& ids,
-    const std::string& requestId,
-    audit::AuditLogger* auditLogger,
-    std::function<void(size_t, size_t)> progressCb) {
+// ---- 解密内存中的密文列表（纯CPU并行） ----
+std::vector<DecryptResult> BatchDecryptor::decryptRecords(
+        const std::vector<database::CipherRecord>& records,
+        const std::string& requestId,
+        audit::AuditLogger* logger,
+        std::function<void(size_t, size_t)> progress) {
+    auto start = std::chrono::steady_clock::now();
 
-    if (ids.empty()) {
-        lastStats_ = {0, 0, 0, 0.0};
+    logger_ = logger;
+    requestId_ = requestId;
+
+    const size_t total = records.size();
+    if (total == 0) {
+        stats_ = {0, 0, 0, 0.0};
         return {};
     }
 
-    auto records = dao_.batchSelectCiphers(ids);
-    return decryptRecords(records, requestId, auditLogger, progressCb);
+    // 提交所有任务
+    size_t index = 0;
+    for (const auto& rec : records) {
+        pushTask(Task{rec, index++});
+    }
+
+    // 收集结果
+    auto results = collectResults(total, progress);
+
+    // 统计
+    stats_.total = total;
+    stats_.successCount = 0;
+    stats_.failCount = 0;
+    for (const auto& r : results) {
+        if (r.success) ++stats_.successCount;
+        else ++stats_.failCount;
+    }
+
+    auto end = std::chrono::steady_clock::now();
+    stats_.elapsedMs = std::chrono::duration<double, std::milli>(end - start).count();
+
+    return results;
+}
+
+// ---- 从数据库批量解密（I/O + 计算流水线） ----
+std::vector<DecryptResult> BatchDecryptor::decryptBatch(
+        const std::vector<int64_t>& ids,
+        const std::string& requestId,
+        audit::AuditLogger* logger,
+        std::function<void(size_t, size_t)> progress) {
+    auto start = std::chrono::steady_clock::now();
+
+    logger_ = logger;
+    requestId_ = requestId;
+
+    const size_t totalIds = ids.size();
+    if (totalIds == 0) {
+        stats_ = {0, 0, 0, 0.0};
+        return {};
+    }
+
+    const size_t IO_BATCH = 32768;
+    size_t index = 0;
+
+    // 生产者：循环读取并提交任务
+    for (size_t offset = 0; offset < ids.size(); offset += IO_BATCH) {
+        size_t end = std::min(offset + IO_BATCH, ids.size());
+        std::vector<int64_t> batchIds(ids.begin() + offset, ids.begin() + end);
+        auto records = dao_.batchSelectCiphers(batchIds);
+        for (auto& rec : records) {
+            pushTask(Task{std::move(rec), index++});
+        }
+    }
+
+    // 收集结果
+    auto results = collectResults(index, progress);
+
+    // 统计
+    stats_.total = index;
+    stats_.successCount = 0;
+    stats_.failCount = 0;
+    for (const auto& r : results) {
+        if (r.success) ++stats_.successCount;
+        else ++stats_.failCount;
+    }
+
+    auto end = std::chrono::steady_clock::now();
+    stats_.elapsedMs = std::chrono::duration<double, std::milli>(end - start).count();
+
+    return results;
 }
 
 } // namespace decrypt

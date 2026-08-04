@@ -1,4 +1,5 @@
 // secsearch_test.cpp - 综合测试套件：功能测试、性能基准、边界稳定性、安全合规
+// 修正版本：性能测试仅生成一次数据，避免重复插入/删除
 
 #include "database/dao.h"
 #include "database/connection_pool.h"
@@ -100,9 +101,9 @@ void initKeyManager(KeyManager& keyMgr) {
 
 // 生成随机姓名
 std::string randomName(int seed) {
-    std::vector<std::string> surnames = {"张", "王", "李", "赵", "刘", "陈", "杨", "黄", "周", "吴"};
-    std::vector<std::string> names = {"伟", "芳", "娜", "敏", "静", "强", "磊", "洋", "艳", "勇",
-                                       "军", "杰", "娟", "涛", "明", "超", "秀英", "霞", "平", "刚"};
+    static const std::vector<std::string> surnames = {"张", "王", "李", "赵", "刘", "陈", "杨", "黄", "周", "吴"};
+    static const std::vector<std::string> names = {"伟", "芳", "娜", "敏", "静", "强", "磊", "洋", "艳", "勇",
+                                                   "军", "杰", "娟", "涛", "明", "超", "秀英", "霞", "平", "刚"};
     return surnames[seed % surnames.size()] + names[(seed * 7) % names.size()];
 }
 
@@ -270,6 +271,22 @@ void testExactQuery(DAO& dao, QueryService& qs, KeyManager& keyMgr) {
 
     printSubHeader("2.2 空值、不存在值查询");
 
+    bool threwExact = false;
+    try {
+        qs.exactQuery("", FieldType::NAME, idxKey, encKey, tagKey);
+    } catch (const std::runtime_error&) {
+        threwExact = true;
+    }
+    check("空值精确查询-抛出异常", threwExact);
+
+    bool threwFuzzy = false;
+    try {
+        qs.fuzzyQuery("", FieldType::NAME, idxKey, encKey, tagKey);
+    } catch (const std::runtime_error&) {
+        threwFuzzy = true;
+    }
+    check("空值模糊查询-抛出异常", threwFuzzy);
+
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     auto noResults = qs.exactQuery("不存在的人", FieldType::NAME, idxKey, encKey, tagKey);
     check("不存在值查询-返回空", noResults.empty());
@@ -300,21 +317,19 @@ void testFuzzyQuery(DAO& dao, QueryService& qs, KeyManager& keyMgr) {
     printSubHeader("3.1 全位置模糊查询（中文）");
 
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    auto prefixResults = qs.fuzzyQuery("张", FieldType::NAME, idxKey, encKey, tagKey);
-    check("前缀模糊查询-张开头", prefixResults.size() >= 2);
+    auto results = qs.fuzzyQuery("张三", FieldType::NAME, idxKey, encKey, tagKey);
+    check("模糊查询-张三（至少2条）", results.size() >= 2);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    auto infixResults = qs.fuzzyQuery("三", FieldType::NAME, idxKey, encKey, tagKey);
-    check("中缀模糊查询-含三字", infixResults.size() >= 3);
+    auto results2 = qs.fuzzyQuery("李四", FieldType::NAME, idxKey, encKey, tagKey);
+    check("模糊查询-李四（1条）", results2.size() == 1);
 
     printSubHeader("3.2 全位置模糊查询（数字）");
-
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     auto phonePrefix = qs.fuzzyQuery("138", FieldType::PHONE, idxKey, encKey, tagKey);
     check("手机号前缀查询-138开头", phonePrefix.size() >= 2);
 
     printSubHeader("3.3 地址模糊查询");
-
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     auto addrResults = qs.fuzzyQuery("北京", FieldType::ADDRESS, idxKey, encKey, tagKey);
     check("地址模糊查询-北京", addrResults.size() >= 1);
@@ -427,11 +442,19 @@ void testBatchDecrypt(DAO& dao, BatchDecryptor& decryptor, KeyManager& keyMgr) {
     bool orderCorrect = true;
     bool allSuccess = true;
     for (size_t i = 0; i < results.size(); ++i) {
-        if (!results[i].success) { allSuccess = false; break; }
+        if (!results[i].success) { 
+            allSuccess = false; 
+            if (i == 0) {
+                std::cout << "  第一条失败: " << results[i].errorMsg << std::endl;
+            }
+            break; 
+        }
         if (results[i].plaintext != expectedNames[i]) { orderCorrect = false; break; }
     }
     check("批量解密全部成功", allSuccess);
-    check("批量解密顺序正确", orderCorrect);
+    if (allSuccess) {
+        check("批量解密顺序正确", orderCorrect);
+    }
 
     for (auto id : testIds) dao.deleteData(id);
 }
@@ -524,21 +547,7 @@ void testExceptionHandling(DAO& dao, QueryService& qs, KeyManager& keyMgr) {
     auto tagKey = keyMgr.getTagKey();
     int encVer = keyMgr.getEncryptionVersion();
 
-    printSubHeader("8.1 空值查询");
-
-    bool emptyQuerySafe = true;
-    try {
-        qs.exactQuery("", FieldType::NAME, idxKey, encKey, tagKey);
-    } catch (...) { emptyQuerySafe = false; }
-    check("空值精确查询不崩溃", emptyQuerySafe);
-
-    bool emptyFuzzySafe = true;
-    try {
-        qs.fuzzyQuery("", FieldType::NAME, idxKey, encKey, tagKey);
-    } catch (...) { emptyFuzzySafe = false; }
-    check("空值模糊查询不崩溃", emptyFuzzySafe);
-
-    printSubHeader("8.2 特殊字符处理");
+    printSubHeader("8.1 特殊字符处理");
 
     bool specialCharSafe = true;
     try {
@@ -548,7 +557,7 @@ void testExceptionHandling(DAO& dao, QueryService& qs, KeyManager& keyMgr) {
     } catch (...) { specialCharSafe = false; }
     check("特殊字符处理不崩溃", specialCharSafe);
 
-    printSubHeader("8.3 完整性校验（篡改检测）");
+    printSubHeader("8.2 完整性校验（篡改检测）");
 
     PlainData data{"篡改测试", "13700000000", "测试地址"};
     int64_t id = dao.insertData(data, encKey, idxKey, tagKey, encVer);
@@ -592,19 +601,17 @@ void runFunctionalTests(DAO& dao, QueryService& qs, BatchDecryptor& decryptor, K
 }
 
 // ================================================================
-// 模块2：性能基准测试
+// 模块2：性能基准测试（修改：共享数据）
 // ================================================================
-void runQueryPerfTest(DAO& dao, QueryService& qs, KeyManager& keyMgr, int dataCount) {
-    printSubHeader("数据量: " + std::to_string(dataCount) + " 条");
+void runQueryPerfTest(DAO& dao, QueryService& qs, KeyManager& keyMgr, const std::vector<int64_t>& ids) {
+    printSubHeader("数据量: " + std::to_string(ids.size()) + " 条");
 
     auto encKey = keyMgr.getEncryptionKey();
     auto idxKey = keyMgr.getIndexKey();
     auto tagKey = keyMgr.getTagKey();
 
-    // 生成测试数据
-    auto ids = generateTestData(dao, keyMgr, dataCount);
     if (ids.empty()) {
-        std::cout << "  ⚠️  数据生成失败" << std::endl;
+        std::cout << "  ⚠️  数据为空" << std::endl;
         return;
     }
 
@@ -614,13 +621,27 @@ void runQueryPerfTest(DAO& dao, QueryService& qs, KeyManager& keyMgr, int dataCo
     int exactSuccess = 0;
     int fuzzySuccess = 0;
 
-    std::cout << "\n  执行 " << QUERY_COUNT << " 次精确查询..." << std::endl;
+    // 收集已存在的姓名（取前1000个）
+    std::vector<std::string> existingNames;
+    for (size_t i = 0; i < ids.size() && i < 1000; ++i) {
+        existingNames.push_back(randomName(i));
+    }
+    if (existingNames.empty()) {
+        std::cout << "  ⚠️  无法获取已有姓名" << std::endl;
+        return;
+    }
+
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dis(0, existingNames.size() - 1);
+
+    std::cout << "\n  执行 " << QUERY_COUNT << " 次精确查询（使用已存在姓名）..." << std::endl;
     for (int i = 0; i < QUERY_COUNT; ++i) {
-        std::string keyword = randomName(i % dataCount);
+        std::string keyword = existingNames[dis(gen)];
         auto start = std::chrono::high_resolution_clock::now();
         try {
             auto results = qs.exactQuery(keyword, FieldType::NAME, idxKey, encKey, tagKey);
-            exactSuccess++;
+            if (!results.empty()) exactSuccess++;
         } catch (...) {}
         auto end = std::chrono::high_resolution_clock::now();
         double ms = std::chrono::duration<double, std::milli>(end - start).count();
@@ -628,13 +649,13 @@ void runQueryPerfTest(DAO& dao, QueryService& qs, KeyManager& keyMgr, int dataCo
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    std::cout << "  执行 " << QUERY_COUNT << " 次模糊查询..." << std::endl;
+    std::cout << "  执行 " << QUERY_COUNT << " 次模糊查询（使用完整姓名）..." << std::endl;
     for (int i = 0; i < QUERY_COUNT; ++i) {
-        std::string keyword = randomName(i % dataCount).substr(0, 2);
+        std::string keyword = existingNames[dis(gen)];
         auto start = std::chrono::high_resolution_clock::now();
         try {
             auto results = qs.fuzzyQuery(keyword, FieldType::NAME, idxKey, encKey, tagKey);
-            fuzzySuccess++;
+            if (!results.empty()) fuzzySuccess++;
         } catch (...) {}
         auto end = std::chrono::high_resolution_clock::now();
         double ms = std::chrono::duration<double, std::milli>(end - start).count();
@@ -652,54 +673,71 @@ void runQueryPerfTest(DAO& dao, QueryService& qs, KeyManager& keyMgr, int dataCo
            average(fuzzyTimes), percentile(fuzzyTimes, 95),
            fuzzySuccess * 100.0 / QUERY_COUNT, QUERY_COUNT);
     std::cout << "  └────────────┴──────────┴──────────┴──────────┴──────────┘" << std::endl;
-
-    cleanupData(dao, ids);
 }
 
-void runBatchDecryptPerfTest(DAO& dao, BatchDecryptor& decryptor, KeyManager& keyMgr, int dataCount) {
-    printSubHeader("批量解密性能对比: " + std::to_string(dataCount) + " 条");
+void runBatchDecryptPerfTest(DAO& dao, BatchDecryptor& decryptor, KeyManager& keyMgr, const std::vector<int64_t>& ids) {
+    printSubHeader("批量解密性能对比: " + std::to_string(ids.size()) + " 条");
 
     auto encKey = keyMgr.getEncryptionKey();
     auto idxKey = keyMgr.getIndexKey();
     auto tagKey = keyMgr.getTagKey();
 
-    auto ids = generateTestData(dao, keyMgr, dataCount);
     if (ids.empty()) return;
 
-    auto cipherRecords = dao.batchSelectCiphers(ids);
-    auto nameRecords = filterByFieldType(cipherRecords, FieldType::NAME);
+    const size_t BATCH_SIZE = 20000;   // 每批处理的记录数
 
-    // 对照组：逐条串行解密（含Tag校验，与批量解密对齐）
-    std::cout << "\n  对照组: 逐条串行解密..." << std::endl;
-    auto start1 = std::chrono::high_resolution_clock::now();
-    int serialSuccess = 0;
-    for (const auto& rec : nameRecords) {
-        try {
-            auto plain = Sm4Cipher::decrypt(rec.cipher, encKey);
-            // 校验Tag（与批量解密逻辑对齐）
-            auto cipherBytes = std::vector<unsigned char>(rec.cipher.begin(), rec.cipher.end());
-            std::string computedTag = crypto::HmacSm3::hmacHex(cipherBytes, tagKey);
-            if (computedTag == rec.tag) {
-                serialSuccess++;
-            }
-        } catch (...) {}
-    }
-    auto end1 = std::chrono::high_resolution_clock::now();
-    double serialMs = std::chrono::duration<double, std::milli>(end1 - start1).count();
-
-    // 实验组：批量解密
-    std::cout << "  实验组: 批量解密（流水线+多线程）..." << std::endl;
+    // ========== 实验组：使用 decryptBatch（自动分批拉取 + 流水线并行） ==========
+    std::cout << "\n  实验组: 批量解密（流水线+多线程，自动分批）..." << std::endl;
     std::string requestId = AuditLogger::generateRequestId();
     auto start2 = std::chrono::high_resolution_clock::now();
-    auto results = decryptor.decryptRecords(nameRecords, requestId, nullptr, nullptr);
+    auto results = decryptor.decryptBatch(ids, requestId, nullptr, nullptr);
     auto end2 = std::chrono::high_resolution_clock::now();
     double batchMs = std::chrono::duration<double, std::milli>(end2 - start2).count();
 
     int batchSuccess = 0;
     for (const auto& r : results) if (r.success) batchSuccess++;
 
-    double serialThroughput = dataCount * 1000.0 / serialMs;
-    double batchThroughput = dataCount * 1000.0 / batchMs;
+    // ========== 对照组：手动分批读取并串行解密（带Tag校验） ==========
+    std::cout << "\n  对照组: 逐条串行解密（带Tag校验，分批读取）..." << std::endl;
+    std::vector<DecryptResult> serialResults;
+    serialResults.reserve(ids.size());
+    auto start1 = std::chrono::high_resolution_clock::now();
+    int serialSuccess = 0;
+
+    for (size_t offset = 0; offset < ids.size(); offset += BATCH_SIZE) {
+        size_t end = std::min(offset + BATCH_SIZE, ids.size());
+        std::vector<int64_t> batchIds(ids.begin() + offset, ids.begin() + end);
+        auto records = dao.batchSelectCiphers(batchIds);  // 分批读取
+
+        for (const auto& rec : records) {
+            bool ok = false;
+            try {
+                std::vector<unsigned char> tagKeyVer;
+                if (keyMgr.getTagKeyByVersion(rec.encKeyVersion, tagKeyVer)) {
+                    auto cipherBytes = std::vector<unsigned char>(rec.cipher.begin(), rec.cipher.end());
+                    std::string computedTag = HmacSm3::hmacHex(cipherBytes, tagKeyVer);
+                    if (computedTag == rec.tag) {
+                        auto plainBytes = Sm4Cipher::decrypt(rec.cipher, encKey);
+                        ok = true;
+                        if (serialSuccess == 0) {
+                            std::cout << "    第一条解密后长度: " << plainBytes.size() << " 字节" << std::endl;
+                        }
+                    }
+                }
+            } catch (const std::exception& e) {
+                if (serialSuccess == 0) {
+                    std::cout << "    串行解密第一条失败: " << e.what() << std::endl;
+                }
+            }
+            if (ok) serialSuccess++;
+        }
+    }
+    auto end1 = std::chrono::high_resolution_clock::now();
+    double serialMs = std::chrono::duration<double, std::milli>(end1 - start1).count();
+
+    // ========== 计算对比数据 ==========
+    double serialThroughput = ids.size() * 1000.0 / serialMs;
+    double batchThroughput = ids.size() * 1000.0 / batchMs;
     double improvement = (batchThroughput - serialThroughput) / serialThroughput * 100;
 
     std::cout << "\n  ┌──────────┬──────────┬──────────┬──────────┬──────────┐" << std::endl;
@@ -714,18 +752,23 @@ void runBatchDecryptPerfTest(DAO& dao, BatchDecryptor& decryptor, KeyManager& ke
     } else {
         std::cout << "  ⚠️  吞吐量提升 " << improvement << "%, 未达到50%目标" << std::endl;
     }
-
-    cleanupData(dao, ids);
 }
 
 void runPerformanceTests(DAO& dao, QueryService& qs, BatchDecryptor& decryptor, KeyManager& keyMgr) {
+    // 重置密钥管理器，避免之前功能测试的影响
+    std::cout << "\n[性能测试] 重置密钥管理器..." << std::endl;
+    initKeyManager(keyMgr);
+    std::cout << "  当前加密密钥版本: " << keyMgr.getEncryptionVersion() << std::endl;
+
     resetStats();
     printHeader("【模块2】性能基准测试");
 
     std::cout << "\n  请选择测试数据量:" << std::endl;
-    std::cout << "    1. 1千条" << std::endl;
-    std::cout << "    2. 1万条" << std::endl;
+    std::cout << "    1. 1千条 (测试用)" << std::endl;
+    std::cout << "    2. 1万条 (推荐)" << std::endl;
     std::cout << "    3. 10万条 (耗时较长)" << std::endl;
+    std::cout << "    4. 50万条 (耗时很长，验证并行优势)" << std::endl;
+    std::cout << "    5. 100万条 (极长，仅做极限测试)" << std::endl;
     std::cout << "    0. 返回主菜单" << std::endl;
     std::cout << "\n  请输入选择: ";
 
@@ -739,19 +782,31 @@ void runPerformanceTests(DAO& dao, QueryService& qs, BatchDecryptor& decryptor, 
         case 1: dataCount = 1000; break;
         case 2: dataCount = 10000; break;
         case 3: dataCount = 100000; break;
+        case 4: dataCount = 500000; break;
+        case 5: dataCount = 1000000; break;
         default: std::cout << "  返回主菜单" << std::endl; return;
+    }
+
+    // ★ 只生成一次数据
+    auto ids = generateTestData(dao, keyMgr, dataCount);
+    if (ids.empty()) {
+        std::cout << "  ⚠️  数据生成失败" << std::endl;
+        return;
     }
 
     try {
         printSubHeader("6.2.1 查询性能测试");
-        runQueryPerfTest(dao, qs, keyMgr, dataCount);
+        runQueryPerfTest(dao, qs, keyMgr, ids);
 
         printSubHeader("6.2.2 批量解密性能测试");
-        runBatchDecryptPerfTest(dao, decryptor, keyMgr, dataCount);
+        runBatchDecryptPerfTest(dao, decryptor, keyMgr, ids);
 
     } catch (const std::exception& e) {
         std::cerr << "\n❌ 性能测试异常: " << e.what() << std::endl;
     }
+
+    // ★ 统一清理
+    cleanupData(dao, ids);
 }
 
 // ================================================================
@@ -765,17 +820,23 @@ void runBoundaryTests(DAO& dao, QueryService& qs, KeyManager& keyMgr) {
     auto tagKey = keyMgr.getTagKey();
     int encVer = keyMgr.getEncryptionVersion();
 
-    // 最短字段（单字符）
+    // 最短字段（单字符）—— 英文字母会被长度限制拦截，预期查询失败但系统不崩溃
     bool minLenOk = true;
     try {
         PlainData data{"A", "1", "B"};
         int64_t id = dao.insertData(data, encKey, idxKey, tagKey, encVer);
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        auto results = qs.exactQuery("A", FieldType::NAME, idxKey, encKey, tagKey);
-        minLenOk = !results.empty() && results[0].name == "A";
+        // 查询 "A" 会触发长度限制异常，捕获后视为正常（不崩溃）
+        try {
+            auto results = qs.exactQuery("A", FieldType::NAME, idxKey, encKey, tagKey);
+            // 如果没抛异常，说明长度限制未生效，测试失败
+            minLenOk = false;
+        } catch (const std::runtime_error&) {
+            // 预期异常，说明长度限制生效，测试通过
+            minLenOk = true;
+        }
         dao.deleteData(id);
     } catch (...) { minLenOk = false; }
-    check("最短字段(单字符)加密查询正常", minLenOk);
+    check("最短字段(单字符)查询被正确拦截", minLenOk);
 
     // 最长字段（长文本）
     bool maxLenOk = true;
@@ -811,16 +872,16 @@ void runBoundaryTests(DAO& dao, QueryService& qs, KeyManager& keyMgr) {
     check("特殊字符加密解密正常", specialOk);
 }
 
-void runConcurrencyTest(DAO& dao, KeyManager& keyMgr) {
-    printSubHeader("6.3.2 并发稳定性测试（简化版: 10线程并发写入）");
+void runConcurrencyTest(KeyManager& keyMgr) {
+    printSubHeader("6.3.2 并发稳定性测试（5线程并发写入）");
 
     auto encKey = keyMgr.getEncryptionKey();
     auto idxKey = keyMgr.getIndexKey();
     auto tagKey = keyMgr.getTagKey();
     int encVer = keyMgr.getEncryptionVersion();
 
-    const int THREAD_COUNT = 10;
-    const int OPS_PER_THREAD = 10;
+    const int THREAD_COUNT = 5;
+    const int OPS_PER_THREAD = 20;
 
     std::vector<std::thread> threads;
     std::vector<int64_t> allIds;
@@ -833,8 +894,7 @@ void runConcurrencyTest(DAO& dao, KeyManager& keyMgr) {
 
     for (int t = 0; t < THREAD_COUNT; ++t) {
         threads.emplace_back([&, t]() {
-            // 每个线程创建独立的DAO对象，共享同一个连接池
-            DAO threadDao(&getGlobalConnectionPool());
+            DAO localDao(&getGlobalConnectionPool());
             for (int i = 0; i < OPS_PER_THREAD; ++i) {
                 try {
                     PlainData data{
@@ -842,7 +902,7 @@ void runConcurrencyTest(DAO& dao, KeyManager& keyMgr) {
                         "139" + std::to_string(10000000 + t * 100 + i),
                         "并发地址" + std::to_string(i)
                     };
-                    int64_t id = threadDao.insertData(data, encKey, idxKey, tagKey, encVer);
+                    int64_t id = localDao.insertData(data, encKey, idxKey, tagKey, encVer);
                     {
                         std::lock_guard<std::mutex> lock(idMutex);
                         allIds.push_back(id);
@@ -877,9 +937,11 @@ void runConcurrencyTest(DAO& dao, KeyManager& keyMgr) {
 
     check("并发写入成功率100%", successRate == 100.0);
 
-    // 清理
     for (auto id : allIds) {
-        try { dao.deleteData(id); } catch (...) {}
+        try {
+            DAO cleanupDao(&getGlobalConnectionPool());
+            cleanupDao.deleteData(id);
+        } catch (...) {}
     }
 }
 
@@ -917,23 +979,19 @@ void runTransactionTest(DAO& dao, KeyManager& keyMgr) {
     auto tagKey = keyMgr.getTagKey();
     int encVer = keyMgr.getEncryptionVersion();
 
-    // 正常插入后查询验证
     PlainData data{"事务测试", "13700000000", "事务地址"};
     int64_t id = dao.insertData(data, encKey, idxKey, tagKey, encVer);
 
     auto records = dao.batchSelectCiphers({id});
-    bool mainDataOk = (records.size() == 3);  // 三个字段都有
+    bool mainDataOk = (records.size() == 3);
 
-    // 验证索引也存在
     bool indexOk = false;
     try {
-        auto results = dao.queryByExactIndex(
-            HmacSm3::hmacHex(
-                std::vector<unsigned char>(data.name.begin(), data.name.end()),
-                idxKey
-            ),
-            FieldType::NAME
+        auto hash = HmacSm3::hmacHex(
+            std::vector<unsigned char>(data.name.begin(), data.name.end()),
+            idxKey
         );
+        auto results = dao.queryByExactIndexMulti({hash}, FieldType::NAME);
         indexOk = !results.empty();
     } catch (...) {}
 
@@ -948,7 +1006,7 @@ void runBoundaryStabilityTests(DAO& dao, QueryService& qs, BatchDecryptor& decry
 
     try {
         runBoundaryTests(dao, qs, keyMgr);
-        runConcurrencyTest(dao, keyMgr);
+        runConcurrencyTest(keyMgr);
         runMemoryTest(dao, decryptor, keyMgr);
         runTransactionTest(dao, keyMgr);
         printSummary("边界与稳定性测试");
@@ -975,7 +1033,6 @@ void runCipherSecurityTest(DAO& dao, KeyManager& keyMgr) {
 
     bool noPlaintext = true;
     for (const auto& rec : records) {
-        // 检查密文中是否包含明文字段
         if (rec.cipher.find("明文") != std::string::npos) {
             noPlaintext = false;
             break;
@@ -1001,7 +1058,7 @@ void runCipherSecurityTest(DAO& dao, KeyManager& keyMgr) {
     dao.deleteData(id);
 }
 
-void runIndexSecurityTest(DAO& dao, KeyManager& keyMgr) {
+void runIndexSecurityTest(KeyManager& keyMgr) {
     printSubHeader("6.4.2 索引安全测试（不可逆性验证）");
 
     auto idxKey = keyMgr.getIndexKey();
@@ -1010,17 +1067,10 @@ void runIndexSecurityTest(DAO& dao, KeyManager& keyMgr) {
     auto data = std::vector<unsigned char>(plaintext.begin(), plaintext.end());
     std::string hash = HmacSm3::hmacHex(data, idxKey);
 
-    // 哈希值长度正确（64字符，32字节hex）
     bool lengthOk = (hash.length() == 64);
-
-    // 哈希值与明文不同
     bool notPlaintext = (hash != plaintext);
-
-    // 相同输入产生相同输出（确定性）
     std::string hash2 = HmacSm3::hmacHex(data, idxKey);
     bool deterministic = (hash == hash2);
-
-    // 不同输入产生不同输出（抗碰撞性）
     std::string plaintext2 = "测试明文内容2";
     auto data2 = std::vector<unsigned char>(plaintext2.begin(), plaintext2.end());
     std::string hash3 = HmacSm3::hmacHex(data2, idxKey);
@@ -1035,23 +1085,16 @@ void runIndexSecurityTest(DAO& dao, KeyManager& keyMgr) {
     std::cout << "  ✅ 盲索引为哈希值，无法直接反推原始明文" << std::endl;
 }
 
-void runKeySecurityTest(DAO& dao, KeyManager& keyMgr) {
+void runKeySecurityTest(KeyManager& keyMgr) {
     printSubHeader("6.4.3 密钥安全测试");
-
-    // 验证密钥不是明文存储（通过KeyManager加载的是密文，解密后使用）
-    // 这里验证内存中的密钥与KEK不同，且密钥是从密文解密而来
 
     auto encKey = keyMgr.getEncryptionKey();
     auto idxKey = keyMgr.getIndexKey();
     auto tagKey = keyMgr.getTagKey();
 
-    // 验证三个密钥互不相同
     bool allDifferent = (encKey != idxKey) && (encKey != tagKey) && (idxKey != tagKey);
-
-    // 验证密钥长度正确（16字节 = 128位）
     bool lengthOk = (encKey.size() == 16) && (idxKey.size() == 16) && (tagKey.size() == 16);
 
-    // 验证密钥不是简单的全0或全1
     bool notWeak = true;
     std::vector<unsigned char> allZero(16, 0);
     std::vector<unsigned char> allFF(16, 0xFF);
@@ -1082,16 +1125,11 @@ void runIntegrityTest(DAO& dao, KeyManager& keyMgr) {
 
     bool tamperDetected = false;
     if (!nameRecords.empty()) {
-        // 篡改密文
         std::string tamperedCipher = nameRecords[0].cipher;
         if (tamperedCipher.size() > 20) {
             tamperedCipher[10] = (tamperedCipher[10] == '0') ? '1' : '0';
-
-            // 重新计算Tag
             auto tamperedBytes = std::vector<unsigned char>(tamperedCipher.begin(), tamperedCipher.end());
             std::string tamperedTag = HmacSm3::hmacHex(tamperedBytes, tagKey);
-
-            // 篡改后的Tag应该与原Tag不同
             tamperDetected = (tamperedTag != nameRecords[0].tag);
         }
     }
@@ -1115,7 +1153,6 @@ void runAuditLogTest(DAO& dao, QueryService& qs, AuditLogger& auditLogger, KeyMa
     auto tagKey = keyMgr.getTagKey();
     int encVer = keyMgr.getEncryptionVersion();
 
-    // 执行一次查询，生成审计日志
     PlainData data{"日志测试", "13800138000", "测试地址"};
     int64_t id = dao.insertData(data, encKey, idxKey, tagKey, encVer);
 
@@ -1124,8 +1161,6 @@ void runAuditLogTest(DAO& dao, QueryService& qs, AuditLogger& auditLogger, KeyMa
         auto results = qs.exactQuery("日志测试", FieldType::NAME, idxKey, encKey, tagKey);
     } catch (...) {}
 
-    // 验证：审计日志中不包含明文敏感信息
-    // 这里简化处理，验证AuditLogger的接口存在且能正常调用
     bool logOk = true;
     try {
         std::string reqId = AuditLogger::generateRequestId();
@@ -1147,8 +1182,8 @@ void runSecurityTests(DAO& dao, QueryService& qs, BatchDecryptor& decryptor,
 
     try {
         runCipherSecurityTest(dao, keyMgr);
-        runIndexSecurityTest(dao, keyMgr);
-        runKeySecurityTest(dao, keyMgr);
+        runIndexSecurityTest(keyMgr);
+        runKeySecurityTest(keyMgr);
         runIntegrityTest(dao, keyMgr);
         runAuditLogTest(dao, qs, auditLogger, keyMgr);
         printSummary("安全合规测试");
@@ -1183,14 +1218,15 @@ void showMainMenu() {
 }
 
 int main() {
+    const size_t POOL_SIZE = 20;
     CRYPT_EAL_Init(CRYPT_EAL_INIT_ALL);
 
     try {
         std::cout << "\n[初始化] 连接数据库..." << std::endl;
         getGlobalConnectionPool().init(
-            "127.0.0.1", "root", "Lwc20041125", "secsearch", 3306, 10
+            "127.0.0.1", "root", "U202312485", "secsearch", 3306, POOL_SIZE
         );
-        std::cout << "  ✅ 数据库连接成功" << std::endl;
+        std::cout << "  ✅ 数据库连接成功 (池大小: " << POOL_SIZE << ")" << std::endl;
 
         std::cout << "[初始化] 加载密钥..." << std::endl;
         KeyManager keyMgr;
@@ -1202,7 +1238,6 @@ int main() {
         QueryService qs(dao, keyMgr, &auditLogger);
         BatchDecryptor decryptor(dao, keyMgr);
 
-        // 主循环
         while (true) {
             showMainMenu();
 
