@@ -22,7 +22,6 @@ find_package(ZLIB REQUIRED)
 find_library(ZSTD_LIBRARY NAMES zstd PATHS /usr/lib /usr/lib/x86_64-linux-gnu)
 
 find_library(BOUNDSCHECK_LIBRARY NAMES boundscheck PATHS ${CMAKE_SOURCE_DIR}/lib)
-# ★ 关键修正：如果未找到，置空，避免链接时引用无效路径
 if(BOUNDSCHECK_LIBRARY AND BOUNDSCHECK_LIBRARY MATCHES "-NOTFOUND$")
     set(BOUNDSCHECK_LIBRARY "")
 endif()
@@ -30,6 +29,29 @@ endif()
 find_path(HITLS_INCLUDE_DIR NAMES hitls/crypto/crypt_eal_cipher.h PATHS ${CMAKE_SOURCE_DIR}/include /usr/local/include /usr/include)
 find_library(HITLS_CRYPTO_LIBRARY NAMES hitls_crypto PATHS ${CMAKE_SOURCE_DIR}/lib /usr/local/lib /usr/lib)
 find_library(HITLS_BSL_LIBRARY NAMES hitls_bsl PATHS ${CMAKE_SOURCE_DIR}/lib /usr/local/lib /usr/lib)
+
+# ==========  GmSSL（支持项目内和系统路径） ==========
+find_path(GMSSL_INCLUDE_DIR
+    NAMES gmssl/sm4.h
+    PATHS ${CMAKE_SOURCE_DIR}/include          # 项目内 include
+          /usr/local/gmssl/include
+          /usr/local/include
+          /usr/include
+)
+
+find_library(GMSSL_LIBRARY
+    NAMES gmssl
+    PATHS ${CMAKE_SOURCE_DIR}/lib              # 项目内 lib
+          /usr/local/gmssl/lib
+          /usr/local/lib
+          /usr/lib
+)
+
+if(GMSSL_INCLUDE_DIR AND GMSSL_LIBRARY)
+    message(STATUS "GmSSL found: ${GMSSL_INCLUDE_DIR}")
+else()
+    message(WARNING "GmSSL not found. benchmark_sm4 will not be built.")
+endif()
 
 # ---- 公共源码 ----
 set(COMMON_SRC
@@ -76,6 +98,26 @@ target_link_libraries(SecSearch secsearch_common ${LINK_LIBS})
 add_executable(SecSearch_test src/secsearch_test.cpp)
 target_link_libraries(SecSearch_test secsearch_common ${LINK_LIBS})
 
+# ==========  性能对比测试 (OpenHiTLS vs GmSSL) ==========
+if(GMSSL_INCLUDE_DIR AND GMSSL_LIBRARY)
+    add_executable(benchmark_sm4 src/benchmark_sm4.cpp)
+    target_include_directories(benchmark_sm4 PRIVATE
+        ${GMSSL_INCLUDE_DIR}
+        ${HITLS_INCLUDE_DIR}
+    )
+    target_link_libraries(benchmark_sm4
+        ${HITLS_CRYPTO_LIBRARY}
+        ${HITLS_BSL_LIBRARY}
+        ${GMSSL_LIBRARY}
+        pthread
+        dl
+    )
+    # 如果找到了 boundscheck，才链接（可选）
+    if(BOUNDSCHECK_LIBRARY)
+        target_link_libraries(benchmark_sm4 ${BOUNDSCHECK_LIBRARY})
+    endif()
+endif()
+
 # ---- 配置检查 ----
 if(NOT BOUNDSCHECK_LIBRARY)
     message(WARNING "boundscheck library not found. If you see undefined references to __security_check_cookie or memcpy_s, please install libboundscheck.")
@@ -92,4 +134,8 @@ message(STATUS "MySQL library: ${MYSQL_LIBRARY}")
 message(STATUS "OpenHiTLS inc: ${HITLS_INCLUDE_DIR}")
 message(STATUS "OpenHiTLS crypto: ${HITLS_CRYPTO_LIBRARY}")
 message(STATUS "OpenHiTLS bsl:    ${HITLS_BSL_LIBRARY}")
+if(GMSSL_INCLUDE_DIR)
+    message(STATUS "GmSSL include: ${GMSSL_INCLUDE_DIR}")
+    message(STATUS "GmSSL library: ${GMSSL_LIBRARY}")
+endif()
 message(STATUS "========================================")
