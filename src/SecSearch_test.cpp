@@ -22,6 +22,8 @@
 #include <random>
 #include <sstream>
 #include <cmath>
+#include <functional>
+#include <map>
 
 using namespace crypto;
 using namespace database;
@@ -580,11 +582,236 @@ void testExceptionHandling(DAO& dao, QueryService& qs, KeyManager& keyMgr) {
     dao.deleteData(id);
 }
 
+// ================================================================
+// ★ 演示模块：数据集构造 + 精确匹配查准查全 + 模糊搜索覆盖度
+// ================================================================
+struct DemoDataset {
+    std::vector<int64_t> ids;
+    std::vector<PlainData> records;
+};
+
+// 真实省市区地址库
+static const std::vector<std::string> REAL_ADDRESSES = {
+    "湖北省武汉市洪山区", "湖北省武汉市武昌区", "湖北省武汉市江汉区", "湖北省武汉市硚口区",
+    "广东省广州市天河区", "广东省广州市越秀区", "广东省广州市海珠区", "广东省广州市白云区",
+    "广东省深圳市南山区", "广东省深圳市福田区", "广东省深圳市罗湖区", "广东省深圳市宝安区",
+    "北京市海淀区", "北京市朝阳区", "北京市西城区", "北京市东城区", "北京市丰台区",
+    "上海市浦东新区", "上海市徐汇区", "上海市静安区", "上海市黄浦区", "上海市闵行区",
+    "四川省成都市武侯区", "四川省成都市锦江区", "四川省成都市青羊区", "四川省成都市成华区",
+    "浙江省杭州市西湖区", "浙江省杭州市余杭区", "浙江省杭州市拱墅区", "浙江省杭州市滨江区",
+    "江苏省南京市鼓楼区", "江苏省南京市玄武区", "江苏省苏州市姑苏区", "江苏省无锡市梁溪区",
+    "陕西省西安市雁塔区", "陕西省西安市碑林区", "陕西省西安市未央区", "陕西省西安市长安区",
+    "山东省济南市历下区", "山东省济南市市中区", "山东省青岛市市南区", "山东省青岛市崂山区",
+    "辽宁省沈阳市和平区", "辽宁省沈阳市沈河区", "辽宁省大连市中山区", "辽宁省大连市沙河口区",
+    "福建省厦门市思明区", "福建省厦门市湖里区", "福建省福州市鼓楼区", "福建省泉州市鲤城区",
+    "湖南省长沙市岳麓区", "湖南省长沙市天心区", "湖南省长沙市芙蓉区", "湖南省株洲市天元区",
+    "河南省郑州市金水区", "河南省郑州市中原区", "河南省洛阳市涧西区", "河南省开封市鼓楼区",
+    "安徽省合肥市蜀山区", "安徽省合肥市庐阳区", "安徽省芜湖市镜湖区", "安徽省蚌埠市蚌山区",
+    "江西省南昌市东湖区", "江西省南昌市西湖区", "江西省赣州市章贡区", "江西省九江市浔阳区",
+    "云南省昆明市五华区", "云南省昆明市盘龙区", "云南省大理市下关区", "云南省丽江市古城区",
+    "贵州省贵阳市南明区", "贵州省贵阳市云岩区", "贵州省遵义市红花岗区",
+    "甘肃省兰州市城关区", "甘肃省兰州市七里河区", "甘肃省天水市秦州区",
+    "黑龙江省哈尔滨市南岗区", "黑龙江省哈尔滨市道里区", "黑龙江省齐齐哈尔市龙沙区",
+    "吉林省长春市朝阳区", "吉林省长春市南关区", "吉林省吉林市船营区",
+    "山西省太原市小店区", "山西省太原市迎泽区", "山西省大同市平城区",
+    "河北省石家庄市长安区", "河北省石家庄市桥西区", "河北省唐山市路北区",
+    "广西壮族自治区南宁市青秀区", "广西壮族自治区南宁市西乡塘区", "广西壮族自治区桂林市秀峰区",
+    "内蒙古自治区呼和浩特市新城区", "内蒙古自治区呼和浩特市赛罕区", "内蒙古自治区包头市昆都仑区",
+    "新疆维吾尔自治区乌鲁木齐市天山区", "新疆维吾尔自治区乌鲁木齐市沙依巴克区",
+    "宁夏回族自治区银川市兴庆区", "宁夏回族自治区银川市金凤区",
+    "青海省西宁市城西区", "青海省西宁市城东区",
+    "海南省海口市美兰区", "海南省海口市龙华区", "海南省三亚市吉阳区", "海南省三亚市天涯区",
+};
+
+// 真实手机号段
+static const std::vector<std::string> PHONE_PREFIXES = {
+    "130","131","132","133","134","135","136","137","138","139",
+    "150","151","152","153","155","156","157","158","159",
+    "170","171","172","173","175","176","177","178",
+    "180","181","182","183","184","185","186","187","188","189"
+};
+
+// 生成真实随机手机号
+static std::string genRealPhone(std::mt19937& gen) {
+    std::string prefix = PHONE_PREFIXES[gen() % PHONE_PREFIXES.size()];
+    std::uniform_int_distribution<> dis(0, 9);
+    std::string suffix;
+    for (int i = 0; i < 8; ++i) suffix += std::to_string(dis(gen));
+    return prefix + suffix;
+}
+
+// 演示1：构造1000条随机测试数据集
+DemoDataset demoConstructDataset(DAO& dao, KeyManager& keyMgr) {
+    printSubHeader("演示1：构造测试数据集（1000条·真实姓名/手机号/地址）");
+
+    auto encKey = keyMgr.getEncryptionKey();
+    auto idxKey = keyMgr.getIndexKey();
+    auto tagKey = keyMgr.getTagKey();
+    int encVer = keyMgr.getEncryptionVersion();
+
+    const int N = 1000;
+    std::random_device rd;
+    std::mt19937 gen(rd());
+
+    std::vector<PlainData> dataset;
+    dataset.reserve(N);
+    for (int i = 0; i < N; ++i) {
+        dataset.push_back({
+            randomName(gen() % 100000),
+            genRealPhone(gen),
+            REAL_ADDRESSES[gen() % REAL_ADDRESSES.size()]
+        });
+    }
+
+    // 统计特征
+    std::map<std::string, int> nameCnt, addrCnt, prefixCnt;
+    for (const auto& d : dataset) {
+        nameCnt[d.name]++;
+        addrCnt[d.address]++;
+        prefixCnt[d.phone.substr(0, 3)]++;
+    }
+
+    // 打印前5条样例
+    std::cout << "\n  数据样例（前5条）:\n";
+    std::cout << "  ┌──────┬──────────┬─────────────┬──────────────────────┐\n";
+    std::cout << "  │ 序号 │ 姓名     │ 手机号      │ 地址                 │\n";
+    std::cout << "  ├──────┼──────────┼─────────────┼──────────────────────┤\n";
+    for (int i = 0; i < 5; ++i) {
+        printf("  │ %4d │ %-8s │ %-11s │ %-20s │\n",
+               i + 1, dataset[i].name.c_str(), dataset[i].phone.c_str(), dataset[i].address.c_str());
+    }
+    std::cout << "  └──────┴──────────┴─────────────┴──────────────────────┘\n";
+
+    std::cout << "\n  数据集统计: 总" << N << "条 | 不重复姓名" << nameCnt.size()
+              << "个 | 不重复地址" << addrCnt.size() << "个 | 手机号段" << prefixCnt.size() << "种\n";
+
+    // 插入数据库
+    std::cout << "  正在加密插入数据库...\n";
+    DemoDataset result;
+    result.records = dataset;
+    for (const auto& d : dataset) {
+        try {
+            int64_t id = dao.insertData(d, encKey, idxKey, tagKey, encVer);
+            result.ids.push_back(id);
+        } catch (const std::exception& e) {
+            std::cerr << "  插入失败: " << e.what() << "\n";
+        }
+    }
+    std::cout << "  完成，成功插入 " << result.ids.size() << " 条\n";
+
+    check("数据集构造成功", result.ids.size() == (size_t)N);
+    return result;
+}
+
+// 演示2：验证精确匹配的查准率与查全率
+void demoExactPrecisionRecall(DAO& dao, QueryService& qs, KeyManager& keyMgr, const DemoDataset& dataset) {
+    printSubHeader("演示2：精确匹配查准率与查全率");
+
+    auto encKey = keyMgr.getEncryptionKey();
+    auto idxKey = keyMgr.getIndexKey();
+    auto tagKey = keyMgr.getTagKey();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    // 统计姓名出现次数，取Top5作为测试用例
+    std::map<std::string, int> nameCnt;
+    for (const auto& d : dataset.records) nameCnt[d.name]++;
+    std::vector<std::pair<std::string, int>> topNames(nameCnt.begin(), nameCnt.end());
+    std::sort(topNames.begin(), topNames.end(), [](const auto& a, const auto& b){ return a.second > b.second; });
+
+    std::cout << "\n  ┌──────────┬──────────┬──────────┬──────────┬──────────┐\n";
+    std::cout << "  │ 姓名     │ 预期数   │ 返回数   │ 查准率   │ 查全率   │\n";
+    std::cout << "  ├──────────┼──────────┼──────────┼──────────┼──────────┤\n";
+
+    double sumP = 0, sumR = 0;
+    int cnt = 0;
+    for (int i = 0; i < 5 && i < (int)topNames.size(); ++i) {
+        const auto& name = topNames[i].first;
+        int expected = topNames[i].second;
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        auto results = qs.exactQuery(name, FieldType::NAME, idxKey, encKey, tagKey);
+        int returned = results.size();
+        int relevant = 0;
+        for (const auto& r : results) if (r.name == name) relevant++;
+        double p = (returned > 0) ? relevant * 100.0 / returned : 100.0;
+        double r = (expected > 0) ? relevant * 100.0 / expected : 100.0;
+        printf("  │ %-8s │ %8d │ %8d │ %6.1f%% │ %6.1f%% │\n", name.c_str(), expected, returned, p, r);
+        sumP += p; sumR += r; cnt++;
+    }
+    std::cout << "  └──────────┴──────────┴──────────┴──────────┴──────────┘\n";
+    printf("  平均查准率: %.1f%% | 平均查全率: %.1f%%\n", sumP / cnt, sumR / cnt);
+
+    check("精确查询查准率=100%", sumP / cnt == 100.0);
+    check("精确查询查全率=100%", sumR / cnt == 100.0);
+}
+
+// 演示3：验证模糊搜索的覆盖度
+void demoFuzzyCoverage(DAO& dao, QueryService& qs, KeyManager& keyMgr, const DemoDataset& dataset) {
+    printSubHeader("演示3：模糊搜索覆盖度");
+
+    auto encKey = keyMgr.getEncryptionKey();
+    auto idxKey = keyMgr.getIndexKey();
+    auto tagKey = keyMgr.getTagKey();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    // 取高频姓名作为模糊关键词（长度≥2）
+    std::map<std::string, int> nameCnt;
+    for (const auto& d : dataset.records) nameCnt[d.name]++;
+    std::vector<std::pair<std::string, int>> topNames(nameCnt.begin(), nameCnt.end());
+    std::sort(topNames.begin(), topNames.end(), [](const auto& a, const auto& b){ return a.second > b.second; });
+
+    struct Case {
+        std::string kw;
+        FieldType field;
+        std::string fname;
+        std::function<bool(const PlainData&)> match;
+    };
+    std::vector<Case> cases;
+    for (int i = 0; i < 2 && i < (int)topNames.size(); ++i) {
+        std::string n = topNames[i].first;
+        cases.push_back({n, FieldType::NAME, "姓名", [n](const PlainData& d){ return d.name.find(n) != std::string::npos; }});
+    }
+    cases.push_back({"138", FieldType::PHONE, "手机号", [](const PlainData& d){ return d.phone.find("138") != std::string::npos; }});
+    cases.push_back({"北京", FieldType::ADDRESS, "地址", [](const PlainData& d){ return d.address.find("北京") != std::string::npos; }});
+    cases.push_back({"武汉", FieldType::ADDRESS, "地址", [](const PlainData& d){ return d.address.find("武汉") != std::string::npos; }});
+
+    std::cout << "\n  ┌──────────┬──────────┬──────────┬──────────┬──────────┐\n";
+    std::cout << "  │ 关键词   │ 字段     │ 预期数   │ 命中数   │ 覆盖度   │\n";
+    std::cout << "  ├──────────┼──────────┼──────────┼──────────┼──────────┤\n";
+
+    double sumCov = 0;
+    for (const auto& tc : cases) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        int expected = 0;
+        for (const auto& d : dataset.records) if (tc.match(d)) expected++;
+        auto results = qs.fuzzyQuery(tc.kw, tc.field, idxKey, encKey, tagKey);
+        int hit = 0;
+        for (const auto& r : results) {
+            std::string v = (tc.field == FieldType::NAME) ? r.name : (tc.field == FieldType::PHONE) ? r.phone : r.address;
+            if (v.find(tc.kw) != std::string::npos) hit++;
+        }
+        double cov = (expected > 0) ? hit * 100.0 / expected : 100.0;
+        sumCov += cov;
+        printf("  │ %-8s │ %-8s │ %8d │ %8d │ %6.1f%% │\n", tc.kw.c_str(), tc.fname.c_str(), expected, hit, cov);
+    }
+    std::cout << "  └──────────┴──────────┴──────────┴──────────┴──────────┘\n";
+    printf("  平均覆盖度: %.1f%%\n", sumCov / cases.size());
+
+    check("模糊搜索覆盖度≥100%", sumCov / cases.size() >= 100.0);
+}
+
 void runFunctionalTests(DAO& dao, QueryService& qs, BatchDecryptor& decryptor, KeyManager& keyMgr) {
     resetStats();
     printHeader("【模块1】功能测试");
 
     try {
+        // ★ 演示模块（最重要的展示部分：数据集构造 + 查准查全 + 模糊覆盖度）
+        DemoDataset demoData = demoConstructDataset(dao, keyMgr);
+        demoExactPrecisionRecall(dao, qs, keyMgr, demoData);
+        demoFuzzyCoverage(dao, qs, keyMgr, demoData);
+        cleanupData(dao, demoData.ids);
+
         testEncryptionStorage(dao, keyMgr);
         testExactQuery(dao, qs, keyMgr);
         testFuzzyQuery(dao, qs, keyMgr);
