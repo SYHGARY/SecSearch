@@ -148,6 +148,31 @@ if(GMSSL_INCLUDE_DIR AND GMSSL_LIBRARY)
     if(BOUNDSCHECK_LIBRARY)
         target_link_libraries(SecSearch_SM4test ${BOUNDSCHECK_LIBRARY})
     endif()
+
+    # ★ GmSSL串行 vs OpenHiTLS流水线 解密+HMAC校验 性能对比（使用MySQL）
+    add_executable(SecSearch_PerfCompare src/SecSearch_PerfCompare.cpp)
+    target_include_directories(SecSearch_PerfCompare PRIVATE
+        ${GMSSL_INCLUDE_DIR}
+        ${HITLS_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/include
+        ${MYSQL_INCLUDE_DIR}
+    )
+    target_link_libraries(SecSearch_PerfCompare
+        secsearch_common
+        ${HITLS_CRYPTO_LIBRARY}
+        ${HITLS_BSL_LIBRARY}
+        ${GMSSL_LIBRARY}
+        ${MYSQL_LIBRARY}
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        ZLIB::ZLIB
+        ${ZSTD_LIBRARY}
+        pthread
+        dl
+    )
+    if(BOUNDSCHECK_LIBRARY)
+        target_link_libraries(SecSearch_PerfCompare ${BOUNDSCHECK_LIBRARY})
+    endif()
 endif()
 
 # ============================================================
