@@ -24,28 +24,29 @@
 ## 目录结构
 
 ```
-SecSearch/
-├── CMakeLists.txt              # CMake 构建配置
-├── create_table.sql            # 数据库建表语句
+SecSearch/    
+├── CMakeLists.txt                  # CMake 构建配置
+├── create_table.sql                # 数据库建表语句
 ├── include/
-│   ├── crypto/                 # 加密模块 (sm4/hmac/key_manager/utils)
-│   ├── database/               # 数据库模块 (连接池/DAO/事务)
-│   ├── query/                  # 查询服务 (精确/模糊/批量解密)
-│   ├── decrypt/                # 批量解密流水线
-│   ├── audit/                  # 审计日志 & 索引重建
-│   ├── hitls/                  # OpenHiTLS 头文件
-│   ├── gmssl/                  # GmSSL 头文件
-│   └── mysql/                  # MySQL 头文件
+│   ├── crypto/                     # 加密模块 (sm4/hmac/key_manager/utils)
+│   ├── database/                   # 数据库模块 (连接池/DAO/事务)
+│   ├── query/                      # 查询服务 (精确/模糊/批量解密)
+│   ├── decrypt/                    # 批量解密流水线
+│   ├── audit/                      # 审计日志 & 索引重建
+│   ├── hitls/                      # OpenHiTLS 头文件
+│   ├── gmssl/                      # GmSSL 头文件
+│   └── mysql/                      # MySQL 头文件
 ├── src/
-│   ├── main.cpp                # 主程序入口 (交互式 CLI)
-│   ├── SecSearch_test.cpp      # 全量测试文件
-│   ├── SecSearch_SM4test/cpp   # SM4算法优化测试文件
+│   ├── main.cpp                    # 主程序入口 (交互式 CLI)
+│   ├── SecSearch_test.cpp          # 全量测试文件
+│   ├── SecSearch_SM4test.cpp       # SM4算法优化测试文件
+│   ├── SecSearch_PerfCompare.cpp   # 性能优化总收益测试文件
 │   ├── crypto/
 │   ├── database/
 │   ├── query/
 │   ├── decrypt/
 │   └── audit/
-└── lib/                        # 第三方静态库 (OpenHiTLS + MySQL + GmSSL)
+└── lib/                            # 第三方静态库 (OpenHiTLS + MySQL + GmSSL)
 ```
 
 ## 环境要求
